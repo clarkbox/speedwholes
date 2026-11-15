@@ -10,7 +10,7 @@ license = "MIT"
 axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "catch-panic", "set-header"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic", "set-header"] }
 
 # TLS crypto provider (required by rustls)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
