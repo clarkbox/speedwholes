@@ -17,7 +17,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 # Image processing
 image = "0.25"
-imagesize = "0.13"
+imagesize = "0.15"
 fast_image_resize = "6"
 turbojpeg = { version = "1", features = ["image"] }
 
