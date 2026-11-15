@@ -1,0 +1,48 @@
+[Unit]
+Description=Speedwholes Backend API Server
+After=network.target
+Documentation=https://github.com/clarkbox/speedwholes
+
+[Service]
+Type=simple
+User=speedwholes
+Group=speedwholes
+WorkingDirectory=/etc/speedwholes
+
+# Config dir is /etc/speedwholes, cache path comes from config file
+ExecStart=/usr/local/bin/speedwholes --config-dir /etc/speedwholes
+
+# Log level
+Environment="RUST_LOG=speedwholes=info"
+
+# Restart policy
+Restart=always
+RestartSec=10s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+# Allow binding to privileged ports (443)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Allow reading Let's Encrypt certificates (required for HTTPS)
+ReadOnlyPaths=/etc/letsencrypt
+
+# Allow writing to config directory and common cache locations
+# Add your custom cache_path here if different (e.g., /speedwholes-cache)
+ReadWritePaths=/etc/speedwholes /var/cache/speedwholes /speedwholes-cache
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=speedwholes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+{
+  "port": 443,
+  "cache_path": "/var/cache/speedwholes",
+  "max_width": 4096,
+  "max_height": 4096,
+  "timeout": 30,
+  "max_source_pixels": 100000000,
+  "max_source_bytes": 52428800,
+  "allowed_sources": ["images.example.com"],
+  "allow_all_sources": false,
+  "allow_private_networks": false,
+  "unknown_host_policy": "reject",
+  "trust_forwarded_host": false,
+  "admin_token": "CHANGE-ME-generate-with-openssl-rand-hex-32",
+  "tls_cert": "/etc/letsencrypt/live/images.example.com/fullchain.pem",
+  "tls_key": "/etc/letsencrypt/live/images.example.com/privkey.pem"
+}

@@ -1,0 +1,2 @@
+[alias]
+dev = ["watch", "-i", "*.pid", "-x", "run -- --port 8089 --cache-path /tmp/speedwhole"]

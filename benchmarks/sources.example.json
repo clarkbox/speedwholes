@@ -1,0 +1,12 @@
+{
+  "sources": [
+    {
+      "name": "local-large",
+      "url": "http://127.0.0.1:8099/large_photo.jpg"
+    },
+    {
+      "name": "local-medium",
+      "url": "http://127.0.0.1:8099/medium_photo.jpg"
+    }
+  ]
+}

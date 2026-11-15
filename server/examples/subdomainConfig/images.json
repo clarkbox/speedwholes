@@ -1,0 +1,11 @@
+{
+  "name": "images",
+  "max_width": 1920,
+  "max_height": 1080,
+  "source_template": "https://images.example.com/{1}/{2}.{0}",
+  "signing_required": false,
+  "allowed_sources": [
+    "*.example.com",
+    "cdn.mysite.com/*"
+  ]
+}

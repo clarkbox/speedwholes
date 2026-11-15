@@ -1,0 +1,42 @@
+# Rust build artifacts
+/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Application cache directory
+/cache/
+
+# Local dev config created by startLocalDev.sh and the README quick start
+dev-config/
+
+# Runtime config (persisted settings)
+**/speedwholes.config.json
+server/subdomainConfig/
+ssl-certs/*.pem
+benchmarks/sources.json
+benchmarks/sources-full.json
+
+# Debug files
+*.pdb
+
+# Backup files
+*.bak
+*.orig
+/server/target
+key.pem
+server/speedwholes.pid
+www/public/config.json
+
+# Build output
+/build/

@@ -1,0 +1,23 @@
+{
+  "name": "DEVLOCAL",
+  "max_width": 5000,
+  "max_height": 5000,
+  "signing_key": "CHANGE-ME-openssl-rand-hex-32",
+  "signing_required": false,
+  "templates": [
+    {
+      "name": "asd",
+      "width": 123,
+      "height": 123,
+      "fit": "cover",
+      "quality": 12,
+      "format": "jpg"
+    },
+    {
+      "name": "dsa",
+      "width": 100,
+      "height": 100,
+      "quality": 70
+    }
+  ]
+}
