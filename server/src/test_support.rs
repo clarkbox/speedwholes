@@ -127,7 +127,7 @@ pub async fn spawn_upstream() -> (SocketAddr, Arc<HitCounter>) {
         .route("/img.png", route_get(serve_png))
         .route("/img.jpg", route_get(serve_jpg))
         .route("/png.jpg", route_get(serve_png_as_jpg))
-        .route("/o/*rest", route_get(serve_o))
+        .route("/o/{*rest}", route_get(serve_o))
         .route("/html", route_get(serve_html))
         .route("/redirect", route_get(serve_redirect))
         .route("/loop", route_get(serve_loop))

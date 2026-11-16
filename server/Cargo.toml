@@ -7,17 +7,20 @@ license = "MIT"
 
 [dependencies]
 # Web framework
-axum = "0.7"
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum = "0.8"
+axum-server = { version = "0.9", features = ["tls-rustls-no-provider"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "catch-panic", "set-header"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic", "set-header"] }
 
 # TLS crypto provider (required by rustls)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # Image processing
-image = "0.25"
-imagesize = "0.13"
+# AVIF stays off. Its encoder pulls rav1e and the unmaintained paste crate,
+# and this service does not write AVIF. image still records that optional
+# dependency in Cargo.lock, so cargo audit can still warn about paste.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "rayon"] }
+imagesize = "0.15"
 fast_image_resize = "6"
 turbojpeg = { version = "1", features = ["image"] }
 
@@ -40,12 +43,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Hashing for cache keys
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # URL signing (HMAC-SHA256)
-hmac = "0.12"
-base64 = "0.22"
+hmac = "0.13"
+base64 = "0.23"
 subtle = "2.5"
 
 # LRU cache for signature verification
@@ -64,7 +67,6 @@ percent-encoding = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 
 # Async utilities
 futures = "0.3"
@@ -77,7 +79,7 @@ chrono = "0.4"
 
 # Process management (Unix signals for PID checking)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "fs"] }
+nix = { version = "0.32", features = ["signal", "fs"] }
 
 [dev-dependencies]
 # Benchmarking

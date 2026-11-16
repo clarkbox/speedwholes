@@ -81,7 +81,7 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::resize_stats_get).delete(handlers::resize_stats_reset),
         )
         .route(
-            "/resize-stats/:subdomain",
+            "/resize-stats/{subdomain}",
             delete(handlers::resize_stats_reset_subdomain),
         )
         .route("/logs", get(handlers::logs_get))
@@ -90,23 +90,23 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::subdomains_get).post(handlers::subdomains_post),
         )
         .route(
-            "/subdomain/:name",
+            "/subdomain/{name}",
             post(handlers::subdomain_save).delete(handlers::subdomain_delete),
         )
         .route(
-            "/subdomain/:name/params",
+            "/subdomain/{name}/params",
             patch(handlers::subdomain_params_patch),
         )
         .route(
-            "/subdomain/:name/template/:template_name",
+            "/subdomain/{name}/template/{template_name}",
             put(handlers::subdomain_template_put).delete(handlers::subdomain_template_delete),
         )
         .route(
-            "/subdomain/:name/cache/resize",
+            "/subdomain/{name}/cache/resize",
             delete(handlers::subdomain_cache_clear_resize),
         )
         .route(
-            "/subdomain/:name/cache/source",
+            "/subdomain/{name}/cache/source",
             delete(handlers::subdomain_cache_clear_source),
         )
         .route("/sign", post(handlers::sign_url))
@@ -145,7 +145,7 @@ pub fn build_router(state: AppState) -> Router {
             "/resize/",
             get(handlers::resize_no_params).layer(csp.clone()),
         )
-        .route("/resize/*rest", get(handlers::resize_handler).layer(csp))
+        .route("/resize/{*rest}", get(handlers::resize_handler).layer(csp))
         .fallback(handlers::not_found)
         .layer(cors)
         .layer(catch_panic_layer)
