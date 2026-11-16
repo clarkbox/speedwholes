@@ -98,6 +98,12 @@ fn default_max_concurrent_resizes() -> usize {
         .unwrap_or(1)
         .clamp(1, 8)
 }
+fn default_source_proxy_quality() -> u8 {
+    90
+}
+fn default_source_proxy_max_fill_percent() -> u8 {
+    85
+}
 fn default_pool_max_idle() -> usize {
     8
 }
@@ -147,6 +153,23 @@ pub struct ServerConfig {
     /// How many resizes may decode and encode at once. Default is `min(cpus, 8)`.
     #[serde(default = "default_max_concurrent_resizes")]
     pub max_concurrent_resizes: usize,
+
+    /// Keep a reduced JPEG of a large JPEG source and resize later requests from
+    /// it when the output fits. This is the proxy's minimum long side, in pixels.
+    /// `0` (default) turns it off.
+    #[serde(default)]
+    pub source_proxy_min_side: u32,
+
+    /// JPEG quality of the stored reduced copy. Default 90. Values outside 1–100
+    /// are clamped when the process starts.
+    #[serde(default = "default_source_proxy_quality")]
+    pub source_proxy_quality: u8,
+
+    /// Largest output, as a percentage of the reduced copy, that is made from it.
+    /// A larger output uses the original. Default 85. Values above 100 are clamped
+    /// when the process starts.
+    #[serde(default = "default_source_proxy_max_fill_percent")]
+    pub source_proxy_max_fill_percent: u8,
 
     /// Allowed source URL patterns
     #[serde(default)]
@@ -216,6 +239,9 @@ impl Default for ServerConfig {
             max_source_pixels: default_max_source_pixels(),
             max_source_bytes: default_max_source_bytes(),
             max_concurrent_resizes: default_max_concurrent_resizes(),
+            source_proxy_min_side: 0,
+            source_proxy_quality: default_source_proxy_quality(),
+            source_proxy_max_fill_percent: default_source_proxy_max_fill_percent(),
             allowed_sources: Vec::new(),
             allow_all_sources: false,
             allow_private_networks: false,
@@ -394,6 +420,9 @@ pub struct ConfigResponse {
     pub max_source_pixels: u64,
     pub max_source_bytes: u64,
     pub max_concurrent_resizes: usize,
+    pub source_proxy_min_side: u32,
+    pub source_proxy_quality: u8,
+    pub source_proxy_max_fill_percent: u8,
     pub allowed_sources: Vec<String>,
     pub allow_all_sources: bool,
     pub allow_private_networks: bool,
@@ -413,6 +442,9 @@ impl From<&ServerConfig> for ConfigResponse {
             max_source_pixels: config.max_source_pixels,
             max_source_bytes: config.max_source_bytes,
             max_concurrent_resizes: config.max_concurrent_resizes,
+            source_proxy_min_side: config.source_proxy_min_side,
+            source_proxy_quality: config.source_proxy_quality,
+            source_proxy_max_fill_percent: config.source_proxy_max_fill_percent,
             allowed_sources: config.allowed_sources.clone(),
             allow_all_sources: config.allow_all_sources,
             allow_private_networks: config.allow_private_networks,
@@ -712,6 +744,10 @@ pub struct AppState {
     pub resize_permits: Arc<tokio::sync::Semaphore>,
     /// How many source images may be held in memory at once.
     pub source_permits: Arc<tokio::sync::Semaphore>,
+    /// How many reduced source copies may be encoded in the background at once.
+    /// A full set means the next resize skips storing a copy instead of queueing
+    /// another decoded image.
+    pub proxy_build_permits: Arc<tokio::sync::Semaphore>,
     /// Identical in-flight resize requests share one result.
     pub inflight: Arc<crate::inflight::Inflight>,
 }
@@ -778,6 +814,12 @@ impl AppState {
         config_dir: PathBuf,
         tls_config: TlsConfig,
     ) -> Self {
+        let mut config = config;
+        // A quality of 0 makes turbojpeg reject the encode. A fill above 100
+        // would compare an output against more than the copy's own size.
+        config.source_proxy_quality = config.source_proxy_quality.clamp(1, 100);
+        config.source_proxy_max_fill_percent = config.source_proxy_max_fill_percent.min(100);
+
         let port = config.port;
         let cache_path = PathBuf::from(&config.cache_path);
         let admin_token = config.admin_token.clone();
@@ -863,6 +905,7 @@ impl AppState {
             // one fetched ahead of it. saturating_mul so a huge config cannot
             // overflow the permit count.
             source_permits: Arc::new(tokio::sync::Semaphore::new(permits.saturating_mul(2))),
+            proxy_build_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
             inflight: Arc::new(crate::inflight::Inflight::default()),
         }
     }
@@ -966,6 +1009,34 @@ mod tests {
         assert!(cfg.allowed_sources.is_empty());
         assert_eq!(cfg.unknown_host_policy, "reject");
         assert!(!cfg.trust_forwarded_host);
+        assert_eq!(cfg.source_proxy_min_side, 0);
+        assert_eq!(cfg.source_proxy_quality, 90);
+        assert_eq!(cfg.source_proxy_max_fill_percent, 85);
+        assert_eq!(ServerConfig::default().source_proxy_min_side, 0);
+    }
+
+    #[test]
+    fn source_proxy_quality_and_fill_are_clamped() {
+        let cfg: ServerConfig = serde_json::from_str(
+            r#"{"source_proxy_quality": 0, "source_proxy_max_fill_percent": 200, "source_proxy_min_side": 1024}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.source_proxy_quality, 0, "serde keeps the file value");
+        let state = AppState::from_config(
+            cfg,
+            std::path::PathBuf::from("."),
+            TlsConfig {
+                cert_path: std::path::PathBuf::from("cert.pem"),
+                key_path: std::path::PathBuf::from("key.pem"),
+            },
+        );
+        assert_eq!(state.config.source_proxy_quality, 1);
+        assert_eq!(state.config.source_proxy_max_fill_percent, 100);
+        assert_eq!(state.config.source_proxy_min_side, 1024);
+        assert_eq!(
+            state.proxy_build_permits.available_permits(),
+            state.resize_permits.available_permits()
+        );
     }
 
     #[test]

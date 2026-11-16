@@ -1271,7 +1271,55 @@ pub async fn resize_handler(
             )
         })?;
 
-    let (image_data, content_type, source_cache_hit) = {
+    // A stored reduced copy stands in for the original when the output fits
+    // inside it. Output dimensions still come from the original's size.
+    // The copy is off unless source_proxy_min_side is set, and bypass always
+    // returns the original bytes.
+    let proxy_min_side = state.config.source_proxy_min_side;
+    let proxy_quality = state.config.source_proxy_quality;
+    let proxy_max_fill = state.config.source_proxy_max_fill_percent;
+    let proxy_key = DiskCache::generate_proxy_key(&full_url, proxy_min_side);
+    let mut proxy_hit: Option<(axum::body::Bytes, crate::resize::ProxyInfo)> = None;
+    let mut proxy_missing = false;
+    if proxy_min_side > 0 && !bypass {
+        match source_cache.get(&proxy_key, "proxy").await {
+            Ok(Some(stored)) => match crate::resize::read_proxy(&stored) {
+                Some(info)
+                    if (info.orig_width as u64).saturating_mul(info.orig_height as u64)
+                        <= state.max_source_pixels() =>
+                {
+                    let (out_w, out_h) = crate::resize::bound_output_dimensions(
+                        info.orig_width,
+                        info.orig_height,
+                        width,
+                        height,
+                        fit,
+                        max_width,
+                        max_height,
+                    );
+                    if info.can_serve(out_w, out_h, proxy_max_fill) {
+                        let jpeg = axum::body::Bytes::from(stored)
+                            .slice(crate::resize::PROXY_HEADER_LEN..);
+                        proxy_hit = Some((jpeg, info));
+                    }
+                }
+                Some(_) | None => {
+                    // Unreadable, larger than the pixel cap, or an older layout.
+                    proxy_missing = true;
+                }
+            },
+            Ok(None) => proxy_missing = true,
+            Err(e) => {
+                tracing::warn!(error = %e, "Source proxy read error, using the original");
+            }
+        }
+    }
+    let proxy_info = proxy_hit.as_ref().map(|(_, info)| *info);
+
+    let (image_data, content_type, source_cache_hit) = if let Some((data, _)) = proxy_hit {
+        state.stats.record_source_cache_hit();
+        (data, Some("image/jpeg".to_string()), true)
+    } else {
         // Check source cache
         match source_cache.get(&source_cache_key, "bin").await {
             Ok(Some(cached_data)) => {
@@ -1485,10 +1533,24 @@ pub async fn resize_handler(
     // Time the resize operation
     let resize_start = std::time::Instant::now();
 
-    // Check image dimensions before full decode (prevents image bomb attacks)
+    // Check image dimensions before full decode (prevents image bomb attacks).
+    // A reduced copy reports its own JPEG size; the output is still computed
+    // from the original dimensions stored in the copy's header.
     let max_source_pixels = state.max_source_pixels();
-    let (orig_width, orig_height) =
-        match crate::resize::check_image_dimensions(&image_data, max_source_pixels) {
+    let checked = crate::resize::check_image_dimensions(&image_data, max_source_pixels);
+    let (orig_width, orig_height) = if let Some(info) = proxy_info {
+        if let Err(e) = checked {
+            tracing::error!(
+                source_url = %full_url,
+                max_source_pixels = max_source_pixels,
+                error = %e,
+                "Image dimensions check failed"
+            );
+            return Err(fail_inflight(&mut flight_leader, e));
+        }
+        (info.orig_width as usize, info.orig_height as usize)
+    } else {
+        match checked {
             Ok(dims) => dims,
             Err(e) => {
                 tracing::error!(
@@ -1499,7 +1561,8 @@ pub async fn resize_handler(
                 );
                 return Err(fail_inflight(&mut flight_leader, e));
             }
-        };
+        }
+    };
     tracing::debug!(
         "Source dimensions: {}x{} ({} pixels)",
         orig_width,
@@ -1522,6 +1585,19 @@ pub async fn resize_handler(
         max_height,
     );
 
+    // First request for a large JPEG: decode at the copy's scale and, if a
+    // build slot is free, keep those pixels to store after the response.
+    // A full slot skips the store. It does not queue another decoded image.
+    let source_dims = u32::try_from(orig_width)
+        .ok()
+        .zip(u32::try_from(orig_height).ok());
+    let build_proxy = proxy_missing
+        && source_dims.is_some()
+        && crate::resize::proxy_dimensions(&image_data, orig_width, orig_height, proxy_min_side)
+            .is_some_and(|(proxy_w, proxy_h)| {
+                crate::resize::proxy_can_serve(proxy_w, proxy_h, width, height, proxy_max_fill)
+            });
+
     // Decode, resize and encode on the blocking pool. The permit covers only that work.
     let permit = state
         .resize_permits
@@ -1538,10 +1614,16 @@ pub async fn resize_handler(
     let encode_as = final_output_extension.to_string();
     let logged_url = full_url.clone();
     let logged_type = content_type.clone();
-    let output_data = match tokio::task::spawn_blocking(move || {
+    let proxy_slots = Arc::clone(&state.proxy_build_permits);
+    let (output_data, proxy_kept) = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _source_permit = source_permit;
-        let (img, extent) = decode_image_exact(&pixels, width, height).map_err(|e| {
+        let decoded = if build_proxy {
+            crate::resize::decode_jpeg_for_proxy(&pixels, proxy_min_side)
+        } else {
+            decode_image_exact(&pixels, width, height)
+        };
+        let (img, extent) = decoded.map_err(|e| {
             tracing::error!(
                 source_url = %logged_url,
                 content_type = ?logged_type,
@@ -1551,8 +1633,25 @@ pub async fn resize_handler(
             );
             e
         })?;
+        let extent = match proxy_info {
+            Some(info) => info.picture_extent(extent),
+            None => extent,
+        };
+        // Take the slot before cloning. try_acquire does not wait, so a busy
+        // encoder cannot stall this request or pile up decoded buffers.
+        let proxy_kept = if build_proxy {
+            match proxy_slots.try_acquire_owned() {
+                Ok(slot) => img.as_rgb8().cloned().map(|rgb| (rgb, slot)),
+                Err(_) => {
+                    tracing::debug!("skipping source proxy; build slots are full");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let resized = resize_image_exact(img, extent, width, height, fit)?;
-        encode_image(resized, &encode_as, quality).map_err(|e| {
+        let encoded = encode_image(resized, &encode_as, quality).map_err(|e| {
             tracing::error!(
                 source_url = %logged_url,
                 output_extension = %encode_as,
@@ -1563,7 +1662,8 @@ pub async fn resize_handler(
                 "Failed to encode resized image"
             );
             e
-        })
+        })?;
+        Ok::<_, AppError>((encoded, proxy_kept))
     })
     .await
     {
@@ -1575,6 +1675,34 @@ pub async fn resize_handler(
             ));
         }
     };
+
+    // Encode and store the copy off the response path. The slot taken above
+    // stays held until this finishes, and the encode waits for a resize permit
+    // so it stays inside the same CPU budget as a request.
+    if let (Some((rgb, slot)), Some((source_w, source_h))) = (proxy_kept, source_dims) {
+        let permits = Arc::clone(&state.resize_permits);
+        let proxy_store = DiskCache::new(source_cache_path.clone(), subdomain.as_deref());
+        tokio::spawn(async move {
+            let _slot = slot;
+            let Ok(permit) = permits.acquire_owned().await else {
+                return;
+            };
+            let encoded = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::resize::encode_proxy(&rgb, source_w, source_h, proxy_min_side, proxy_quality)
+            })
+            .await;
+            match encoded {
+                Ok(Ok(bytes)) => {
+                    if let Err(e) = proxy_store.put(&proxy_key, "proxy", &bytes).await {
+                        tracing::error!("Failed to store source proxy: {}", e);
+                    }
+                }
+                Ok(Err(e)) => tracing::error!("Failed to encode source proxy: {}", e),
+                Err(_) => tracing::error!("Source proxy task failed"),
+            }
+        });
+    }
 
     let resize_time = resize_start.elapsed();
 

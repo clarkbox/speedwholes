@@ -288,6 +288,182 @@ fn decode_jpeg_scaled(
     target_width: u32,
     target_height: u32,
 ) -> Result<(DynamicImage, Extent)> {
+    decode_jpeg_with(data, |src_w, src_h| {
+        Ok(choose_jpeg_scale(src_w, src_h, target_width, target_height))
+    })
+}
+
+/// Prefix of a stored reduced source copy: magic, the original width and height
+/// (little-endian u32), then the decode scale as numerator and denominator
+/// (little-endian u16).
+const PROXY_MAGIC: &[u8; 4] = b"SWP2";
+pub(crate) const PROXY_HEADER_LEN: usize = 16;
+
+/// What a stored reduced copy says about the original.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProxyInfo {
+    pub orig_width: u32,
+    pub orig_height: u32,
+    pub width: u32,
+    pub height: u32,
+    scale: (u16, u16),
+}
+
+impl ProxyInfo {
+    /// The extent of the original picture inside a decode of this copy, given the
+    /// extent that decode reported for the copy's own JPEG.
+    pub(crate) fn picture_extent(&self, decoded: Extent) -> Extent {
+        let (num, denom) = (self.scale.0 as f64, self.scale.1 as f64);
+        Extent {
+            width: decoded.width * (self.orig_width as f64 * num / denom) / self.width as f64,
+            height: decoded.height * (self.orig_height as f64 * num / denom) / self.height as f64,
+        }
+    }
+
+    /// Whether an output of this size may be made from the copy. Outputs close to
+    /// the copy's own size would show its compression, so they use the original.
+    pub(crate) fn can_serve(&self, out_w: u32, out_h: u32, max_fill_percent: u8) -> bool {
+        proxy_can_serve(self.width, self.height, out_w, out_h, max_fill_percent)
+    }
+}
+
+pub(crate) fn proxy_can_serve(
+    proxy_w: u32,
+    proxy_h: u32,
+    out_w: u32,
+    out_h: u32,
+    max_fill_percent: u8,
+) -> bool {
+    let limit = |side: u32| side as u64 * max_fill_percent.min(100) as u64;
+    out_w as u64 * 100 <= limit(proxy_w) && out_h as u64 * 100 <= limit(proxy_h)
+}
+
+/// A reduced libjpeg scale from the header, or nothing if the pair is not one we write.
+fn known_reduced_scale(num: u16, denom: u16) -> Option<turbojpeg::ScalingFactor> {
+    JPEG_SCALE_FACTORS.iter().find_map(|&(n, d)| {
+        if n < d && n == num as usize && d == denom as usize {
+            Some(turbojpeg::ScalingFactor::new(n, d))
+        } else {
+            None
+        }
+    })
+}
+
+/// Parse a stored reduced copy. The JPEG starts at `PROXY_HEADER_LEN`.
+/// A header whose JPEG is not exactly the claimed scale of the original is rejected,
+/// so a mixed or truncated file cannot be decoded as if it were the picture.
+pub(crate) fn read_proxy(data: &[u8]) -> Option<ProxyInfo> {
+    if data.len() <= PROXY_HEADER_LEN || data[..4] != *PROXY_MAGIC {
+        return None;
+    }
+    let orig_width = u32::from_le_bytes(data[4..8].try_into().ok()?);
+    let orig_height = u32::from_le_bytes(data[8..12].try_into().ok()?);
+    let scale_num = u16::from_le_bytes(data[12..14].try_into().ok()?);
+    let scale_denom = u16::from_le_bytes(data[14..16].try_into().ok()?);
+    let scale = known_reduced_scale(scale_num, scale_denom)?;
+    let size = blob_size(&data[PROXY_HEADER_LEN..]).ok()?;
+    let expect_w = scale.scale(orig_width as usize);
+    let expect_h = scale.scale(orig_height as usize);
+    if orig_width == 0
+        || orig_height == 0
+        || size.width == 0
+        || size.height == 0
+        || size.width != expect_w
+        || size.height != expect_h
+    {
+        return None;
+    }
+    Some(ProxyInfo {
+        orig_width,
+        orig_height,
+        width: size.width as u32,
+        height: size.height as u32,
+        scale: (scale_num, scale_denom),
+    })
+}
+
+/// The smallest reduced decode scale whose long side is still at least `min_side`.
+/// `None` when the source is too small for a copy to save anything, or when the
+/// feature is off (`min_side == 0`).
+fn proxy_scale(src_w: usize, src_h: usize, min_side: u32) -> Option<turbojpeg::ScalingFactor> {
+    if min_side == 0 {
+        return None;
+    }
+    for &(num, denom) in JPEG_SCALE_FACTORS {
+        if num == denom {
+            break;
+        }
+        let sf = turbojpeg::ScalingFactor::new(num, denom);
+        if sf.scale(src_w).max(sf.scale(src_h)) >= min_side as usize {
+            return Some(sf);
+        }
+    }
+    None
+}
+
+/// Dimensions the reduced copy of this source would have. `None` for non-JPEG
+/// data and for sources that are not large enough.
+pub(crate) fn proxy_dimensions(
+    data: &[u8],
+    src_w: usize,
+    src_h: usize,
+    min_side: u32,
+) -> Option<(u32, u32)> {
+    if !is_jpeg(data) {
+        return None;
+    }
+    let sf = proxy_scale(src_w, src_h, min_side)?;
+    Some((sf.scale(src_w) as u32, sf.scale(src_h) as u32))
+}
+
+/// Decode a JPEG at its reduced-copy scale.
+/// Refuses a source that is too small instead of decoding it at full size.
+pub(crate) fn decode_jpeg_for_proxy(data: &[u8], min_side: u32) -> Result<(DynamicImage, Extent)> {
+    decode_jpeg_with(data, |src_w, src_h| {
+        proxy_scale(src_w, src_h, min_side).ok_or_else(|| {
+            AppError::DecodeError("source is too small for a reduced copy".to_string())
+        })
+    })
+}
+
+/// Encode pixels for the source cache: a 16-byte header, then a 4:2:0 JPEG.
+/// Quality outside 1–100 is clamped. The buffer must be exactly the scaled size
+/// of the original; a mismatch is an error rather than a header that lies.
+pub(crate) fn encode_proxy(
+    rgb: &image::RgbImage,
+    orig_width: u32,
+    orig_height: u32,
+    min_side: u32,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let scale =
+        proxy_scale(orig_width as usize, orig_height as usize, min_side).ok_or_else(|| {
+            AppError::EncodeError("source is too small for a reduced copy".to_string())
+        })?;
+    let expect_w = scale.scale(orig_width as usize) as u32;
+    let expect_h = scale.scale(orig_height as usize) as u32;
+    if rgb.width() != expect_w || rgb.height() != expect_h {
+        return Err(AppError::EncodeError(
+            "reduced copy pixels do not match the original scale".to_string(),
+        ));
+    }
+    let quality = quality.clamp(1, 100) as i32;
+    let jpeg = turbojpeg::compress_image(rgb, quality, turbojpeg::Subsamp::Sub2x2)
+        .map_err(|e| AppError::EncodeError(format!("turbojpeg proxy encode failed: {e}")))?;
+    let mut out = Vec::with_capacity(PROXY_HEADER_LEN + jpeg.len());
+    out.extend_from_slice(PROXY_MAGIC);
+    out.extend_from_slice(&orig_width.to_le_bytes());
+    out.extend_from_slice(&orig_height.to_le_bytes());
+    out.extend_from_slice(&(scale.num() as u16).to_le_bytes());
+    out.extend_from_slice(&(scale.denom() as u16).to_le_bytes());
+    out.extend_from_slice(&jpeg);
+    Ok(out)
+}
+
+fn decode_jpeg_with(
+    data: &[u8],
+    pick_scale: impl FnOnce(usize, usize) -> Result<turbojpeg::ScalingFactor>,
+) -> Result<(DynamicImage, Extent)> {
     DECOMPRESSOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -308,8 +484,7 @@ fn decode_jpeg_scaled(
         let src_w = header.width;
         let src_h = header.height;
 
-        // Choose optimal scale factor
-        let scale = choose_jpeg_scale(src_w, src_h, target_width, target_height);
+        let scale = pick_scale(src_w, src_h)?;
         decompressor
             .set_scaling_factor(scale)
             .map_err(|e| AppError::DecodeError(format!("turbojpeg set scale failed: {}", e)))?;
@@ -320,14 +495,12 @@ fn decode_jpeg_scaled(
 
         if scale != turbojpeg::ScalingFactor::ONE {
             tracing::debug!(
-                "JPEG scaled decode: {}x{} -> {}x{} (scale {}) for target {}x{}",
+                "JPEG scaled decode: {}x{} -> {}x{} (scale {})",
                 src_w,
                 src_h,
                 width,
                 height,
-                scale,
-                target_width,
-                target_height
+                scale
             );
         }
 
@@ -850,5 +1023,89 @@ mod tests {
             300,
         );
         assert_eq!(tall, (0.0, 100.25, 400.0, 400.0));
+    }
+
+    fn jpeg_fixture(w: u32, h: u32) -> Vec<u8> {
+        let rgb: image::RgbImage =
+            ImageBuffer::from_fn(w, h, |x, y| Rgb([(x % 251) as u8, (y % 241) as u8, 90]));
+        turbojpeg::compress_image(&rgb, 90, turbojpeg::Subsamp::Sub2x2)
+            .expect("encode fixture")
+            .to_vec()
+    }
+
+    #[test]
+    fn proxy_round_trip_keeps_the_original_geometry() {
+        let (src_w, src_h) = (1001u32, 601u32);
+        let jpeg = jpeg_fixture(src_w, src_h);
+        assert_eq!(
+            proxy_dimensions(&jpeg, src_w as usize, src_h as usize, 400),
+            Some((501, 301))
+        );
+        let (img, extent) = decode_jpeg_for_proxy(&jpeg, 400).expect("proxy decode");
+        assert_eq!(
+            extent,
+            Extent {
+                width: 500.5,
+                height: 300.5
+            }
+        );
+
+        let stored =
+            encode_proxy(img.as_rgb8().expect("rgb"), src_w, src_h, 400, 90).expect("proxy encode");
+        let info = read_proxy(&stored).expect("proxy header");
+        assert_eq!((info.orig_width, info.orig_height), (src_w, src_h));
+        assert_eq!((info.width, info.height), (501, 301));
+
+        // A half-scale decode of the copy holds a quarter-scale picture of the original.
+        let (half, half_extent) =
+            decode_image_exact(&stored[PROXY_HEADER_LEN..], 200, 120).expect("decode proxy");
+        assert_eq!((half.width(), half.height()), (251, 151));
+        let picture = info.picture_extent(half_extent);
+        assert!((picture.width - src_w as f64 / 4.0).abs() < 1e-9);
+        assert!((picture.height - src_h as f64 / 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn proxy_serves_only_outputs_inside_the_fill_limit() {
+        assert!(proxy_can_serve(501, 301, 200, 120, 85));
+        assert!(proxy_can_serve(501, 301, 425, 255, 85));
+        assert!(!proxy_can_serve(501, 301, 426, 255, 85));
+        assert!(proxy_can_serve(501, 301, 501, 301, 100));
+        assert!(!proxy_can_serve(501, 301, 1, 1, 0));
+    }
+
+    #[test]
+    fn stale_or_mismatched_proxy_data_is_rejected() {
+        assert!(read_proxy(b"SWP1\x00\x00\x00\x00").is_none());
+        assert!(read_proxy(&[0xFF, 0xD8, 0xFF, 0xE0]).is_none());
+
+        let jpeg = jpeg_fixture(64, 48);
+        let (img, _) = decode_jpeg_for_proxy(&jpeg, 16).expect("small proxy decode");
+        let mut stored =
+            encode_proxy(img.as_rgb8().expect("rgb"), 64, 48, 16, 0).expect("quality 0 is clamped");
+        assert!(read_proxy(&stored).is_some());
+
+        // Claim 1/8 while the JPEG is the 1/4 buffer. The sizes disagree.
+        stored[12] = 1;
+        stored[13] = 0;
+        stored[14] = 8;
+        stored[15] = 0;
+        assert!(read_proxy(&stored).is_none());
+    }
+
+    #[test]
+    fn non_jpeg_and_small_sources_have_no_proxy() {
+        let png = {
+            let rgb: image::RgbImage = ImageBuffer::from_fn(64, 48, |_, _| Rgb([1, 2, 3]));
+            let mut buf = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(rgb)
+                .write_to(&mut buf, ImageFormat::Png)
+                .expect("png");
+            buf.into_inner()
+        };
+        assert!(proxy_dimensions(&png, 64, 48, 16).is_none());
+        let jpeg = jpeg_fixture(32, 24);
+        assert!(proxy_dimensions(&jpeg, 32, 24, 10_000).is_none());
+        assert!(decode_jpeg_for_proxy(&jpeg, 10_000).is_err());
     }
 }

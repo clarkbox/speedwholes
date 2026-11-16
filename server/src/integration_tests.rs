@@ -873,3 +873,148 @@ async fn nocache_requests_do_not_coalesce() {
     assert!(headers1.get("x-speedwholes-coalesced").is_none());
     assert!(headers2.get("x-speedwholes-coalesced").is_none());
 }
+
+fn files_with_ext(dir: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, ext, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+                out.push(path);
+            }
+        }
+    }
+    walk(dir, ext, &mut out);
+    out
+}
+
+async fn wait_for_ext(dir: &std::path::Path, ext: &str) -> std::path::PathBuf {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(path) = files_with_ext(dir, ext).into_iter().next() {
+            return path;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("no .{ext} file appeared under {}", dir.display());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn image_size(bytes: &[u8]) -> (usize, usize) {
+    let size = imagesize::blob_size(bytes).expect("image dimensions");
+    (size.width, size.height)
+}
+
+#[tokio::test]
+async fn source_proxy_is_off_by_default_and_serves_later_sizes() {
+    let (addr, counter) = test_support::spawn_upstream().await;
+    let path = |w, h| {
+        format!(
+            "/resize/w/{w}/h/{h}/u/http://127.0.0.1:{}/img.jpg",
+            addr.port()
+        )
+    };
+
+    let (app_off, dir_off) = test_support::test_app(allow_all(), vec![]);
+    let app_off_2 = app_off.clone();
+    let (status, _, body_off) = test_support::get(app_off, "example.com", &path(4, 4), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_off)
+    );
+    assert_eq!(image_size(&body_off), (4, 4));
+    let (status, _, large_off) =
+        test_support::get(app_off_2, "example.com", &path(16, 12), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(image_size(&large_off), (16, 12));
+    assert!(
+        files_with_ext(dir_off.path(), "proxy").is_empty(),
+        "the default leaves the reduced copy off"
+    );
+
+    let mut on = allow_all();
+    on.source_proxy_min_side = 8;
+    let (app_on, dir_on) = test_support::test_app(on, vec![]);
+    let (status, headers, body_on) =
+        test_support::get(app_on.clone(), "example.com", &path(4, 4), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_on)
+    );
+    assert_eq!(image_size(&body_on), (4, 4));
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/jpeg")
+    );
+    assert!(headers.get("x-speedwholes-proxy").is_none());
+
+    let proxy_path = wait_for_ext(dir_on.path(), "proxy").await;
+    let stored = std::fs::read(&proxy_path).expect("read proxy");
+    assert!(stored.starts_with(b"SWP2"));
+    let _bin = wait_for_ext(dir_on.path(), "bin").await;
+
+    let hits = counter.hits("/img.jpg");
+    let (status, _, large_on) =
+        test_support::get(app_on.clone(), "example.com", &path(16, 12), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&large_on)
+    );
+    assert_eq!(image_size(&large_on), (16, 12));
+    assert_eq!(
+        large_on.as_ref(),
+        large_off.as_ref(),
+        "an output past the fill limit uses the original"
+    );
+    assert_eq!(counter.hits("/img.jpg"), hits);
+
+    for bin in files_with_ext(dir_on.path(), "bin") {
+        std::fs::remove_file(bin).expect("remove original");
+    }
+    let (status, _, small) = test_support::get(app_on, "example.com", &path(3, 3), &[]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&small)
+    );
+    assert_eq!(image_size(&small), (3, 3));
+    assert_eq!(
+        counter.hits("/img.jpg"),
+        hits,
+        "the later size must come from the reduced copy"
+    );
+}
+
+#[tokio::test]
+async fn source_proxy_is_not_built_for_png() {
+    let (addr, _) = test_support::spawn_upstream().await;
+    let mut cfg = allow_all();
+    cfg.source_proxy_min_side = 8;
+    let (app, dir) = test_support::test_app(cfg, vec![]);
+    let path = format!("/resize/w/8/h/8/u/http://127.0.0.1:{}/img.png", addr.port());
+    let (status, headers, body) = test_support::get(app, "example.com", &path, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(image_size(&body), (8, 8));
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png")
+    );
+    assert!(files_with_ext(dir.path(), "proxy").is_empty());
+}

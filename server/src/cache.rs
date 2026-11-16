@@ -127,6 +127,16 @@ impl DiskCache {
         hex::encode(hasher.finalize())
     }
 
+    /// Cache key for a reduced source copy. The size is part of the key, so
+    /// changing `source_proxy_min_side` does not reuse a copy built for another size.
+    pub fn generate_proxy_key(url: &str, min_side: u32) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"proxy:");
+        hasher.update(min_side.to_le_bytes());
+        hasher.update(url.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     /// Get the file path for a cache key (includes subdomain folder)
     fn cache_path(&self, key: &str, extension: &str) -> PathBuf {
         // Path: base_path/subdomain/2-char-prefix/hash.ext

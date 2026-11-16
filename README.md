@@ -9,6 +9,7 @@ Speedwholes is an on-demand image resizing proxy. A client asks for a size, a fi
 - Fit modes `contain`, `cover`, and `fill`. A width or height of `0` keeps the source aspect ratio. `cover` crops to the target aspect first, then resizes to the exact size.
 - A scaled JPEG is resized from the exact picture inside the decoded buffer. Output width and height stay the same. Pixels can differ by less than one decoded pixel from files written by older builds; cached files keep those pixels until they expire.
 - Disk cache for the fetched source and for the resized output. Responses send `X-Speedwholes-Cache: hit` or `miss`. Identical requests that overlap while a result is still being produced share that work; the waiting response also sends `X-Speedwholes-Coalesced: 1`. `nocache` and bypass do not join.
+- Optional reduced JPEG copies of large JPEG sources (`source_proxy_min_side`, off by default). Later sizes that fit inside the copy are resized from it. Output width, height, URLs, formats, and headers stay the same. Pixels can differ slightly from the direct path while the feature is on.
 - Per-tenant HMAC-SHA256 URL signing. A signature is required only when that tenant says so.
 - Multi-tenant by `Host`. `images.example.com` loads the tenant named `images`.
 - Source allowlists, with private and reserved addresses blocked at connect time and again on every redirect.
@@ -271,6 +272,9 @@ Generate the admin token with `openssl rand -hex 32` and keep the file mode `600
 | `max_source_pixels` | `100000000` | Reject a source whose decoded pixel count exceeds this. |
 | `max_source_bytes` | `52428800` | Reject an upstream body larger than 50 MiB. |
 | `max_concurrent_resizes` | `min(cpus, 8)` | How many decodes, resizes, and encodes may run at once. |
+| `source_proxy_min_side` | `0` | Off at `0`. When set, store a reduced JPEG of a large JPEG source whose long side is at least this many pixels, and resize later outputs from that copy when they fit. Non-JPEG sources are unchanged. |
+| `source_proxy_quality` | `90` | JPEG quality of that reduced copy. Clamped to 1–100. |
+| `source_proxy_max_fill_percent` | `85` | Largest output, as a percentage of the reduced copy, that is made from it. A larger output uses the original. Clamped to 0–100. |
 | `allowed_sources` | `[]` | Global source patterns. Used when the tenant list is empty or absent. An empty list allows nothing unless `allow_all_sources` is true. |
 | `allow_all_sources` | `false` | Allow any public host for tenants that do not set their own list. A non-empty tenant list still wins. Private addresses stay blocked. |
 | `allow_private_networks` | `false` | Allow loopback, private, link-local, and other reserved addresses. For a local origin, tests, or benchmarks. |
