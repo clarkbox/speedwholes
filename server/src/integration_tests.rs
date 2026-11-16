@@ -540,7 +540,10 @@ async fn auto_height_is_clamped_and_cover_stays_bounded() {
     );
     let (status, _headers, body) = test_support::get(app, "example.com", &wide, &[]).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // Debug builds on a shared CI runner need more than a few seconds for a
+    // 4096² JPEG. The assertion still fails a resize that runs away.
+    let limit = if cfg!(debug_assertions) { 30 } else { 5 };
+    assert!(started.elapsed() < std::time::Duration::from_secs(limit));
     let img = image::load_from_memory(&body).expect("decode wide output");
     assert_eq!((img.width(), img.height()), (4096, 4096));
 }
