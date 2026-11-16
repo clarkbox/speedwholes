@@ -400,18 +400,14 @@ impl Extent {
     }
 }
 
-/// Decode image bytes into a DynamicImage.
-/// Uses turbojpeg (libjpeg-turbo with SIMD) for JPEG with scaled decoding
-/// when the target is smaller than the source. Falls back to image crate for other formats.
+/// Decode image bytes and report the exact extent of the picture inside the buffer.
+///
+/// Uses turbojpeg (libjpeg-turbo with SIMD) for JPEG, with scaled decoding when
+/// the target is smaller than the source. Other formats use the `image` crate,
+/// whose extent is the whole buffer. Pass both values to `resize_image_exact`
+/// so a scaled JPEG is not stretched.
 ///
 /// `target_width` and `target_height` are the desired output dimensions (0 = auto).
-/// For JPEG, these are used to choose an optimal decode scale factor.
-pub fn decode_image(data: &[u8], target_width: u32, target_height: u32) -> Result<DynamicImage> {
-    decode_image_exact(data, target_width, target_height).map(|(img, _)| img)
-}
-
-/// `decode_image`, plus the exact extent of the picture inside the decoded buffer.
-/// Pass both to `resize_image_exact` so a scaled decode is not stretched.
 pub fn decode_image_exact(
     data: &[u8],
     target_width: u32,
@@ -458,10 +454,7 @@ fn choose_filter(width: u32, height: u32, _src_width: u32, _src_height: u32) -> 
     }
 }
 
-/// Fast SIMD-accelerated resize using fast_image_resize crate
-/// Supports both U8x3 (RGB) and U8x4 (RGBA) pixel types
-fn fast_resize(
-    src_data: &mut [u8],
+struct FastResize {
     src_width: u32,
     src_height: u32,
     dst_width: u32,
@@ -469,19 +462,23 @@ fn fast_resize(
     filter: FilterType,
     pixel_type: PixelType,
     source_box: Option<(f64, f64, f64, f64)>,
-) -> Result<Vec<u8>> {
-    // Ensure dimensions are at least 1
-    let src_w = src_width.max(1);
-    let src_h = src_height.max(1);
-    let dst_w = dst_width.max(1);
-    let dst_h = dst_height.max(1);
+}
 
-    let src_image = FirImage::from_slice_u8(src_w, src_h, src_data, pixel_type)
+/// Fast SIMD-accelerated resize using fast_image_resize crate.
+/// Supports both U8x3 (RGB) and U8x4 (RGBA) pixel types.
+fn fast_resize(src_data: &mut [u8], spec: FastResize) -> Result<Vec<u8>> {
+    // Ensure dimensions are at least 1
+    let src_w = spec.src_width.max(1);
+    let src_h = spec.src_height.max(1);
+    let dst_w = spec.dst_width.max(1);
+    let dst_h = spec.dst_height.max(1);
+
+    let src_image = FirImage::from_slice_u8(src_w, src_h, src_data, spec.pixel_type)
         .map_err(|e| AppError::DecodeError(format!("failed to view source pixels: {e}")))?;
 
-    let mut dst_image = FirImage::new(dst_w, dst_h, pixel_type);
-    let mut options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
-    if let Some((left, top, width, height)) = source_box {
+    let mut dst_image = FirImage::new(dst_w, dst_h, spec.pixel_type);
+    let mut options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(spec.filter));
+    if let Some((left, top, width, height)) = spec.source_box {
         let (left, top, width, height) = crop_inside(src_w, src_h, left, top, width, height)?;
         options = options.crop(left, top, width, height);
     }
@@ -522,23 +519,10 @@ fn crop_inside(
     Ok((left, top, width, height))
 }
 
-/// Resize an image according to the specified parameters
-/// Uses SIMD-accelerated fast_image_resize for better performance.
-/// For RGB8 images (e.g., JPEG via turbojpeg), resizes directly in RGB space
-/// to avoid the wasteful RGB→RGBA→RGB round-trip conversion.
-pub fn resize_image(
-    img: DynamicImage,
-    target_width: u32,
-    target_height: u32,
-    fit_mode: FitMode,
-) -> Result<DynamicImage> {
-    let extent = Extent::of(&img);
-    resize_image_exact(img, extent, target_width, target_height, fit_mode)
-}
-
-/// `resize_image` for a buffer whose picture covers only `extent` of it, as a
-/// scaled JPEG decode does. Sampling from the exact extent keeps the output
-/// registered with the original instead of stretching it by up to one decoded pixel.
+/// Resize `img`, sampling only `extent` of it. A scaled JPEG decode leaves
+/// padding in the last column and row; sampling the exact extent keeps the
+/// output registered with the original. RGB8 images stay in RGB so the
+/// resize does not detour through RGBA.
 pub fn resize_image_exact(
     img: DynamicImage,
     extent: Extent,
@@ -619,13 +603,15 @@ pub fn resize_image_exact(
     };
     let dst_data = fast_resize(
         &mut src_data,
-        orig_width,
-        orig_height,
-        final_width,
-        final_height,
-        filter,
-        pixel_type,
-        source_box,
+        FastResize {
+            src_width: orig_width,
+            src_height: orig_height,
+            dst_width: final_width,
+            dst_height: final_height,
+            filter,
+            pixel_type,
+            source_box,
+        },
     )?;
     make_image(dst_data, final_width, final_height)
 }
@@ -787,7 +773,8 @@ mod tests {
                 quadrant
             }
         }));
-        let out = resize_image(img, 300, 300, FitMode::Cover).expect("cover resize");
+        let extent = Extent::of(&img);
+        let out = resize_image_exact(img, extent, 300, 300, FitMode::Cover).expect("cover resize");
         assert_eq!((out.width(), out.height()), (300, 300));
         let px = out.get_pixel(150, 150);
         for (got, expect) in [px[0], px[1], px[2]].into_iter().zip([200u8, 100, 50]) {
@@ -825,8 +812,6 @@ mod tests {
                 height: 300.5
             }
         );
-        let plain = decode_image(&jpeg, out_w, out_h).expect("decode wrapper");
-        assert_eq!((plain.width(), plain.height()), (img.width(), img.height()));
 
         let out = resize_image_exact(img, extent, out_w, out_h, FitMode::Fill).expect("resize");
         assert_eq!((out.width(), out.height()), (out_w, out_h));
