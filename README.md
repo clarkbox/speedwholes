@@ -7,7 +7,8 @@ Speedwholes is an on-demand image resizing proxy. A client asks for a size, a fi
 - Output formats: JPEG, PNG, WebP, and single-frame GIF. Omit the format and the output matches the source.
 - Named templates (presets) and a default template, so a short URL can stand in for width, height, fit, quality, and format.
 - Fit modes `contain`, `cover`, and `fill`. A width or height of `0` keeps the source aspect ratio. `cover` crops to the target aspect first, then resizes to the exact size.
-- Disk cache for the fetched source and for the resized output. Responses send `X-Speedwholes-Cache: hit` or `miss`.
+- A scaled JPEG is resized from the exact picture inside the decoded buffer. Output width and height stay the same. Pixels can differ by less than one decoded pixel from files written by older builds; cached files keep those pixels until they expire.
+- Disk cache for the fetched source and for the resized output. Responses send `X-Speedwholes-Cache: hit` or `miss`. Identical requests that overlap while a result is still being produced share that work; the waiting response also sends `X-Speedwholes-Coalesced: 1`. `nocache` and bypass do not join.
 - Per-tenant HMAC-SHA256 URL signing. A signature is required only when that tenant says so.
 - Multi-tenant by `Host`. `images.example.com` loads the tenant named `images`.
 - Source allowlists, with private and reserved addresses blocked at connect time and again on every redirect.

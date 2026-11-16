@@ -279,7 +279,15 @@ fn choose_jpeg_scale(
 /// Decode a JPEG using turbojpeg with optional scaled decoding.
 /// When the target is much smaller than the source, libjpeg-turbo decodes at a
 /// reduced resolution in the DCT domain — dramatically faster and lower memory.
-fn decode_jpeg_scaled(data: &[u8], target_width: u32, target_height: u32) -> Result<DynamicImage> {
+///
+/// libjpeg rounds scaled dimensions up, so the last column and row of a scaled
+/// decode can be partly padding. The returned extent is the exact, possibly
+/// fractional, size of the picture inside the decoded buffer.
+fn decode_jpeg_scaled(
+    data: &[u8],
+    target_width: u32,
+    target_height: u32,
+) -> Result<(DynamicImage, Extent)> {
     DECOMPRESSOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -343,26 +351,79 @@ fn decode_jpeg_scaled(data: &[u8], target_width: u32, target_height: u32) -> Res
         let rgb_image: image::RgbImage = ImageBuffer::from_raw(width as u32, height as u32, pixels)
             .ok_or_else(|| AppError::DecodeError("failed to build decoded image".to_string()))?;
 
-        Ok(DynamicImage::ImageRgb8(rgb_image))
+        // Picture size in the decoded buffer. libjpeg's buffer is this value
+        // rounded up, so the last column and row can be padding.
+        let num = scale.num() as f64;
+        let denom = scale.denom() as f64;
+        let extent = Extent {
+            width: src_w as f64 * num / denom,
+            height: src_h as f64 * num / denom,
+        };
+        Ok((DynamicImage::ImageRgb8(rgb_image), extent))
     })
 }
 
-/// Decode image bytes into a DynamicImage.
-/// Uses turbojpeg (libjpeg-turbo with SIMD) for JPEG with scaled decoding
-/// when the target is smaller than the source. Falls back to image crate for other formats.
+/// The part of a decoded buffer that holds picture, in decoded pixels from the
+/// top-left corner. Equal to the buffer size except after a scaled JPEG decode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Extent {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Extent {
+    pub fn of(img: &DynamicImage) -> Self {
+        let (w, h) = img.dimensions();
+        Extent {
+            width: w as f64,
+            height: h as f64,
+        }
+    }
+
+    fn clamped_to(self, width: u32, height: u32) -> Self {
+        let width_px = width as f64;
+        let height_px = height as f64;
+        let w = if self.width.is_finite() {
+            self.width
+        } else {
+            width_px
+        };
+        let h = if self.height.is_finite() {
+            self.height
+        } else {
+            height_px
+        };
+        Extent {
+            width: w.clamp(f64::MIN_POSITIVE, width_px),
+            height: h.clamp(f64::MIN_POSITIVE, height_px),
+        }
+    }
+}
+
+/// Decode image bytes and report the exact extent of the picture inside the buffer.
+///
+/// Uses turbojpeg (libjpeg-turbo with SIMD) for JPEG, with scaled decoding when
+/// the target is smaller than the source. Other formats use the `image` crate,
+/// whose extent is the whole buffer. Pass both values to `resize_image_exact`
+/// so a scaled JPEG is not stretched.
 ///
 /// `target_width` and `target_height` are the desired output dimensions (0 = auto).
-/// For JPEG, these are used to choose an optimal decode scale factor.
-pub fn decode_image(data: &[u8], target_width: u32, target_height: u32) -> Result<DynamicImage> {
+pub fn decode_image_exact(
+    data: &[u8],
+    target_width: u32,
+    target_height: u32,
+) -> Result<(DynamicImage, Extent)> {
     if is_jpeg(data) {
         return decode_jpeg_scaled(data, target_width, target_height);
     }
     // Fall back to image crate for PNG/GIF/WebP/BMP
-    ImageReader::new(Cursor::new(data))
+    let img = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .map_err(|e| AppError::DecodeError(format!("Failed to guess image format: {}", e)))?
         .decode()
-        .map_err(|e| AppError::DecodeError(format!("Failed to decode image: {}", e)))
+        .map_err(|e| AppError::DecodeError(format!("Failed to decode image: {}", e)))?;
+    let extent = Extent::of(&img);
+    Ok((img, extent))
 }
 
 /// Choose the appropriate filter based on target dimensions
@@ -393,28 +454,34 @@ fn choose_filter(width: u32, height: u32, _src_width: u32, _src_height: u32) -> 
     }
 }
 
-/// Fast SIMD-accelerated resize using fast_image_resize crate
-/// Supports both U8x3 (RGB) and U8x4 (RGBA) pixel types
-fn fast_resize(
-    src_data: &mut [u8],
+struct FastResize {
     src_width: u32,
     src_height: u32,
     dst_width: u32,
     dst_height: u32,
     filter: FilterType,
     pixel_type: PixelType,
-) -> Result<Vec<u8>> {
-    // Ensure dimensions are at least 1
-    let src_w = src_width.max(1);
-    let src_h = src_height.max(1);
-    let dst_w = dst_width.max(1);
-    let dst_h = dst_height.max(1);
+    source_box: Option<(f64, f64, f64, f64)>,
+}
 
-    let src_image = FirImage::from_slice_u8(src_w, src_h, src_data, pixel_type)
+/// Fast SIMD-accelerated resize using fast_image_resize crate.
+/// Supports both U8x3 (RGB) and U8x4 (RGBA) pixel types.
+fn fast_resize(src_data: &mut [u8], spec: FastResize) -> Result<Vec<u8>> {
+    // Ensure dimensions are at least 1
+    let src_w = spec.src_width.max(1);
+    let src_h = spec.src_height.max(1);
+    let dst_w = spec.dst_width.max(1);
+    let dst_h = spec.dst_height.max(1);
+
+    let src_image = FirImage::from_slice_u8(src_w, src_h, src_data, spec.pixel_type)
         .map_err(|e| AppError::DecodeError(format!("failed to view source pixels: {e}")))?;
 
-    let mut dst_image = FirImage::new(dst_w, dst_h, pixel_type);
-    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    let mut dst_image = FirImage::new(dst_w, dst_h, spec.pixel_type);
+    let mut options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(spec.filter));
+    if let Some((left, top, width, height)) = spec.source_box {
+        let (left, top, width, height) = crop_inside(src_w, src_h, left, top, width, height)?;
+        options = options.crop(left, top, width, height);
+    }
 
     RESIZER.with(|r| {
         r.borrow_mut()
@@ -425,40 +492,40 @@ fn fast_resize(
     Ok(dst_image.into_vec())
 }
 
-fn bytes_per_pixel(pixel_type: PixelType) -> usize {
-    match pixel_type {
-        PixelType::U8x3 => 3,
-        PixelType::U8x4 => 4,
-        _ => 4,
+/// Keep a source crop inside the decoded buffer. `fast_image_resize` rejects a box
+/// that crosses the edge, including one that only does so by a rounding error.
+fn crop_inside(
+    src_w: u32,
+    src_h: u32,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+) -> Result<(f64, f64, f64, f64)> {
+    if ![left, top, width, height].into_iter().all(f64::is_finite) {
+        return Err(AppError::DecodeError(
+            "source crop is not finite".to_string(),
+        ));
     }
+    let max_w = src_w as f64;
+    let max_h = src_h as f64;
+    let left = left.clamp(0.0, max_w);
+    let top = top.clamp(0.0, max_h);
+    let width = width.min(max_w - left).max(0.0);
+    let height = height.min(max_h - top).max(0.0);
+    if width <= 0.0 || height <= 0.0 {
+        return Err(AppError::DecodeError("source crop is empty".to_string()));
+    }
+    Ok((left, top, width, height))
 }
 
-/// Copy a centered-or-offset rectangle out of a packed pixel buffer.
-fn crop_raw(
-    src: &[u8],
-    src_width: u32,
-    crop_w: u32,
-    crop_h: u32,
-    x: u32,
-    y: u32,
-    bpp: usize,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(crop_w as usize * crop_h as usize * bpp);
-    let row_stride = src_width as usize * bpp;
-    for row in y..(y + crop_h) {
-        let start = row as usize * row_stride + x as usize * bpp;
-        let end = start + crop_w as usize * bpp;
-        out.extend_from_slice(&src[start..end]);
-    }
-    out
-}
-
-/// Resize an image according to the specified parameters
-/// Uses SIMD-accelerated fast_image_resize for better performance.
-/// For RGB8 images (e.g., JPEG via turbojpeg), resizes directly in RGB space
-/// to avoid the wasteful RGB→RGBA→RGB round-trip conversion.
-pub fn resize_image(
+/// Resize `img`, sampling only `extent` of it. A scaled JPEG decode leaves
+/// padding in the last column and row; sampling the exact extent keeps the
+/// output registered with the original. RGB8 images stay in RGB so the
+/// resize does not detour through RGBA.
+pub fn resize_image_exact(
     img: DynamicImage,
+    extent: Extent,
     target_width: u32,
     target_height: u32,
     fit_mode: FitMode,
@@ -469,12 +536,18 @@ pub fn resize_image(
             "source image has a zero dimension".to_string(),
         ));
     }
+    let extent = extent.clamped_to(orig_width, orig_height);
+    let exact = extent.width == orig_width as f64 && extent.height == orig_height as f64;
 
     // The handler has already resolved auto dimensions and applied the caps.
     let (final_width, final_height) = (target_width.max(1), target_height.max(1));
 
     // Skip resize if dimensions match
-    if final_width == orig_width && final_height == orig_height && fit_mode != FitMode::Cover {
+    if exact
+        && final_width == orig_width
+        && final_height == orig_height
+        && fit_mode != FitMode::Cover
+    {
         tracing::debug!("No resize needed, dimensions match");
         return Ok(img);
     }
@@ -517,63 +590,42 @@ pub fn resize_image(
         }
     };
 
-    match fit_mode {
+    // The resizer samples the source box directly, so neither mode copies pixels first.
+    let source_box = match fit_mode {
         FitMode::Contain | FitMode::Fill => {
-            let dst_data = fast_resize(
-                &mut src_data,
-                orig_width,
-                orig_height,
-                final_width,
-                final_height,
-                filter,
-                pixel_type,
-            )?;
-            make_image(dst_data, final_width, final_height)
-        }
-        FitMode::Cover => {
-            // Crop the source to the target aspect, then resize straight to the output.
-            // The intermediate buffer is never larger than the output.
-            let bpp = bytes_per_pixel(pixel_type);
-            let (crop_w, crop_h, x, y) =
-                cover_crop(orig_width, orig_height, final_width, final_height);
-            let mut cropped = if crop_w == orig_width && crop_h == orig_height {
-                src_data
+            if exact {
+                None
             } else {
-                crop_raw(&src_data, orig_width, crop_w, crop_h, x, y, bpp)
-            };
-            let dst_data = fast_resize(
-                &mut cropped,
-                crop_w,
-                crop_h,
-                final_width,
-                final_height,
-                filter,
-                pixel_type,
-            )?;
-            make_image(dst_data, final_width, final_height)
+                Some((0.0, 0.0, extent.width, extent.height))
+            }
         }
-    }
+        FitMode::Cover => Some(cover_box(extent, final_width, final_height)),
+    };
+    let dst_data = fast_resize(
+        &mut src_data,
+        FastResize {
+            src_width: orig_width,
+            src_height: orig_height,
+            dst_width: final_width,
+            dst_height: final_height,
+            filter,
+            pixel_type,
+            source_box,
+        },
+    )?;
+    make_image(dst_data, final_width, final_height)
 }
 
-/// Source rectangle that has the target aspect and is centered in the source.
-fn cover_crop(
-    orig_width: u32,
-    orig_height: u32,
-    target_width: u32,
-    target_height: u32,
-) -> (u32, u32, u32, u32) {
+/// Source box that has the target aspect and is centered in the picture.
+fn cover_box(extent: Extent, target_width: u32, target_height: u32) -> (f64, f64, f64, f64) {
     let target_aspect = target_width as f64 / target_height.max(1) as f64;
-    let source_aspect = orig_width as f64 / orig_height.max(1) as f64;
+    let source_aspect = extent.width / extent.height;
     if source_aspect > target_aspect {
-        let crop_w = ((orig_height as f64) * target_aspect).round() as u32;
-        let crop_w = crop_w.clamp(1, orig_width);
-        let x = orig_width.saturating_sub(crop_w) / 2;
-        (crop_w, orig_height, x, 0)
+        let width = (extent.height * target_aspect).clamp(f64::MIN_POSITIVE, extent.width);
+        ((extent.width - width) / 2.0, 0.0, width, extent.height)
     } else {
-        let crop_h = ((orig_width as f64) / target_aspect).round() as u32;
-        let crop_h = crop_h.clamp(1, orig_height);
-        let y = orig_height.saturating_sub(crop_h) / 2;
-        (orig_width, crop_h, 0, y)
+        let height = (extent.width / target_aspect).clamp(f64::MIN_POSITIVE, extent.height);
+        (0.0, (extent.height - height) / 2.0, extent.width, height)
     }
 }
 
@@ -721,7 +773,8 @@ mod tests {
                 quadrant
             }
         }));
-        let out = resize_image(img, 300, 300, FitMode::Cover).expect("cover resize");
+        let extent = Extent::of(&img);
+        let out = resize_image_exact(img, extent, 300, 300, FitMode::Cover).expect("cover resize");
         assert_eq!((out.width(), out.height()), (300, 300));
         let px = out.get_pixel(150, 150);
         for (got, expect) in [px[0], px[1], px[2]].into_iter().zip([200u8, 100, 50]) {
@@ -730,5 +783,72 @@ mod tests {
                 "center channel {got} vs {expect}"
             );
         }
+    }
+
+    /// A vertical edge at a known place in an odd-width source must land where the
+    /// scale says it should, whichever reduced decode scale is used.
+    #[test]
+    fn scaled_decode_keeps_an_edge_registered() {
+        let (src_w, src_h) = (1001u32, 601u32);
+        let edge = 600u32;
+        let rgb: image::RgbImage = ImageBuffer::from_fn(src_w, src_h, |x, _| {
+            if x < edge {
+                Rgb([20, 20, 20])
+            } else {
+                Rgb([230, 230, 230])
+            }
+        });
+        let jpeg = turbojpeg::compress_image(&rgb, 95, turbojpeg::Subsamp::Sub2x2)
+            .expect("encode fixture")
+            .to_vec();
+
+        let (out_w, out_h) = (500u32, 300u32);
+        let (img, extent) = decode_image_exact(&jpeg, out_w, out_h).expect("decode");
+        assert_eq!((img.width(), img.height()), (501, 301));
+        assert_eq!(
+            extent,
+            Extent {
+                width: 500.5,
+                height: 300.5
+            }
+        );
+
+        let out = resize_image_exact(img, extent, out_w, out_h, FitMode::Fill).expect("resize");
+        assert_eq!((out.width(), out.height()), (out_w, out_h));
+        let row = out.to_rgb8();
+        // Sub-pixel edge position from the luminance crossing on the middle row.
+        let level = |x: u32| row.get_pixel(x, out_h / 2)[0] as f64;
+        let x1 = (0..out_w)
+            .find(|&x| level(x) >= 125.0)
+            .expect("edge present");
+        let x0 = x1 - 1;
+        let crossing = x0 as f64 + (125.0 - level(x0)) / (level(x1) - level(x0)) + 0.5;
+        let expected = edge as f64 * out_w as f64 / src_w as f64;
+        assert!(
+            (crossing - expected).abs() < 0.1,
+            "edge at {crossing:.3}, expected {expected:.3}"
+        );
+    }
+
+    #[test]
+    fn cover_box_is_centered_in_the_extent() {
+        let wide = cover_box(
+            Extent {
+                width: 600.5,
+                height: 400.0,
+            },
+            300,
+            300,
+        );
+        assert_eq!(wide, (100.25, 0.0, 400.0, 400.0));
+        let tall = cover_box(
+            Extent {
+                width: 400.0,
+                height: 600.5,
+            },
+            300,
+            300,
+        );
+        assert_eq!(tall, (0.0, 100.25, 400.0, 400.0));
     }
 }

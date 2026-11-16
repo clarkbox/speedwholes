@@ -7,7 +7,7 @@ use thiserror::Error;
 use tower_http::classify::ServerErrorsFailureClass;
 use tracing::Span;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum AppError {
     #[error("Invalid fit mode: {0}. Valid modes: contain, cover, fill")]
     InvalidFitMode(String),

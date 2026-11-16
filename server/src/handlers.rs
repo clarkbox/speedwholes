@@ -1,11 +1,13 @@
 use crate::auth;
 use crate::cache::{
-    clear_subdomain_cache, extension_from_content_type, get_disk_stats, mime_for_extension,
-    DiskCache, DiskStatsResponse,
+    clear_subdomain_cache, extension_from_content_type, file_body, get_disk_stats,
+    mime_for_extension, CachedFile, DiskCache, DiskStatsResponse,
 };
 use crate::config::{AppState, ConfigResponse, StatsSnapshot, SubdomainConfig};
 use crate::error::{AppError, Result};
-use crate::resize::{decode_image, encode_image, fetch_image, resize_image, FitMode, OutputFormat};
+use crate::resize::{
+    decode_image_exact, encode_image, fetch_image, resize_image_exact, FitMode, OutputFormat,
+};
 use crate::source_filter;
 use axum::{
     extract::{OriginalUri, State},
@@ -20,6 +22,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Build a JSON error response with the given status code and message.
@@ -1139,8 +1142,8 @@ pub async fn resize_handler(
 
     // Check cache (skip if nocache is set)
     if !nocache {
-        match cache.get(&cache_key, output_extension).await {
-            Ok(Some(cached_data)) => {
+        match cache.open(&cache_key, output_extension).await {
+            Ok(Some(cached)) => {
                 state.stats.record_cache_hit();
                 let total_time = request_start.elapsed();
                 tracing::info!(
@@ -1148,8 +1151,10 @@ pub async fn resize_handler(
                     cache_key,
                     format_duration(total_time)
                 );
-                return image_response(
-                    cached_data,
+                let (body, len) = cached.into_body();
+                return image_response_body(
+                    body,
+                    len,
                     output_extension,
                     url_extension,
                     quality,
@@ -1184,20 +1189,99 @@ pub async fn resize_handler(
         }
     }
 
+    // Identical uncached requests share one fetch and resize. Bypass and
+    // nocache do not join: bypass is a different response, and nocache asks
+    // for a fresh one. A failed leader publishes the error so waiters do not
+    // stampede the origin. A dropped leader (the client disconnected) frees
+    // the key and one waiter takes over. Takeovers are bounded.
+    let mut flight_leader = None;
+    if !nocache && !bypass {
+        let flight_key = format!(
+            "{}:{cache_key}",
+            subdomain
+                .as_deref()
+                .unwrap_or(crate::cache::DEFAULT_SUBDOMAIN)
+        );
+        for attempt in 0..INFLIGHT_TAKEOVERS {
+            match state.inflight.join(&flight_key) {
+                crate::inflight::Join::Leader(leader) => {
+                    flight_leader = Some(leader);
+                    break;
+                }
+                crate::inflight::Join::Follower(follower) => match follower.wait().await {
+                    Ok(shared) => {
+                        return coalesced_response(shared, quality, request_start.elapsed());
+                    }
+                    Err(crate::inflight::WaitError::Failed(err)) => return Err((*err).clone()),
+                    Err(crate::inflight::WaitError::Cancelled) => {
+                        if attempt + 1 == INFLIGHT_TAKEOVERS {
+                            tracing::warn!(
+                                flight_key = %flight_key,
+                                "in-flight leaders kept disconnecting; this request will run on its own"
+                            );
+                        }
+                    }
+                },
+            }
+        }
+    }
+
     // Generate source cache key (just URL hash)
     let source_cache_key = DiskCache::generate_source_key(&full_url);
 
     // Try source cache first to avoid network fetch
     let fetch_start = std::time::Instant::now();
+
+    // A large cached original is streamed. It is never buffered, and it does
+    // not take a source-memory permit.
+    if bypass {
+        if let Ok(Some(CachedFile::Large { file, len })) =
+            source_cache.open(&source_cache_key, "bin").await
+        {
+            state.stats.record_source_cache_hit();
+            let max_source_pixels = state.max_source_pixels();
+            let inspected =
+                tokio::task::spawn_blocking(move || inspect_source_file(file, max_source_pixels))
+                    .await
+                    .map_err(|_| AppError::CacheError("cache read task failed".to_string()))?;
+            let (file, extension) = noted(&mut flight_leader, inspected)?;
+            let fetch_time = fetch_start.elapsed();
+            return bypass_image_response(
+                file_body(file),
+                len,
+                extension,
+                request_start.elapsed(),
+                fetch_time,
+                true,
+                nocache,
+            );
+        }
+    }
+
+    // Held while the source bytes are in memory, through the decode.
+    let source_permit = state
+        .source_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            fail_inflight(
+                &mut flight_leader,
+                AppError::EncodeError("internal".to_string()),
+            )
+        })?;
+
     let (image_data, content_type, source_cache_hit) = {
         // Check source cache
         match source_cache.get(&source_cache_key, "bin").await {
             Ok(Some(cached_data)) => {
                 state.stats.record_source_cache_hit();
                 tracing::debug!("Source cache hit: {}", source_cache_key);
-                let content_type =
-                    Some(mime_for_extension(require_image(&cached_data)?).to_string());
-                (cached_data, content_type, true)
+                let content_type = Some(
+                    mime_for_extension(noted(&mut flight_leader, require_image(&cached_data))?)
+                        .to_string(),
+                );
+                (axum::body::Bytes::from(cached_data), content_type, true)
             }
             Ok(None) => {
                 state.stats.record_source_cache_miss();
@@ -1212,13 +1296,18 @@ pub async fn resize_handler(
                 .await
                 {
                     Ok((data, _ct)) => {
-                        let content_type =
-                            Some(mime_for_extension(require_image(&data)?).to_string());
+                        let content_type = Some(
+                            mime_for_extension(noted(&mut flight_leader, require_image(&data))?)
+                                .to_string(),
+                        );
                         // Store in source cache only after the bytes are a supported image.
                         let subdomain_clone = subdomain.clone();
                         let source_cache_clone =
                             DiskCache::new(source_cache_path.clone(), subdomain_clone.as_deref());
                         let source_key_clone = source_cache_key.clone();
+                        // Shared with the cache write. Bytes::clone bumps a
+                        // refcount; it does not copy the image.
+                        let data = axum::body::Bytes::from(data);
                         let data_clone = data.clone();
                         tokio::spawn(async move {
                             if let Err(e) = source_cache_clone
@@ -1239,7 +1328,7 @@ pub async fn resize_handler(
                             error = %e,
                             "Failed to fetch source image"
                         );
-                        return Err(e);
+                        return Err(fail_inflight(&mut flight_leader, e));
                     }
                 }
             }
@@ -1261,9 +1350,11 @@ pub async fn resize_handler(
                 .await
                 {
                     Ok((data, _ct)) => {
-                        let content_type =
-                            Some(mime_for_extension(require_image(&data)?).to_string());
-                        (data, content_type, false)
+                        let content_type = Some(
+                            mime_for_extension(noted(&mut flight_leader, require_image(&data))?)
+                                .to_string(),
+                        );
+                        (axum::body::Bytes::from(data), content_type, false)
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1271,7 +1362,7 @@ pub async fn resize_handler(
                             error = %e,
                             "Failed to fetch source image"
                         );
-                        return Err(e);
+                        return Err(fail_inflight(&mut flight_leader, e));
                     }
                 }
             }
@@ -1289,7 +1380,10 @@ pub async fn resize_handler(
 
     // Bypass mode: return source image directly without resize
     if bypass {
-        crate::resize::check_image_dimensions(&image_data, state.max_source_pixels())?;
+        noted(
+            &mut flight_leader,
+            crate::resize::check_image_dimensions(&image_data, state.max_source_pixels()),
+        )?;
         let total_time = request_start.elapsed();
         let original_extension = extension_from_content_type(content_type.as_deref(), &full_url);
         tracing::info!(
@@ -1299,8 +1393,10 @@ pub async fn resize_handler(
             format_duration(fetch_time),
             format_duration(total_time)
         );
+        let len = image_data.len() as u64;
         return bypass_image_response(
-            image_data,
+            axum::body::Body::from(image_data),
+            len,
             original_extension,
             total_time,
             fetch_time,
@@ -1334,8 +1430,8 @@ pub async fn resize_handler(
 
     // Check cache again with correct extension (in case URL extension was wrong and no format override)
     if !nocache && final_cache_key != cache_key {
-        match cache.get(&final_cache_key, final_output_extension).await {
-            Ok(Some(cached_data)) => {
+        match cache.open(&final_cache_key, final_output_extension).await {
+            Ok(Some(cached)) => {
                 state.stats.record_cache_hit();
                 let total_time = request_start.elapsed();
                 tracing::info!(
@@ -1343,8 +1439,23 @@ pub async fn resize_handler(
                     final_cache_key,
                     format_duration(total_time)
                 );
-                return image_response(
-                    cached_data,
+                // A leader has to publish bytes. The common cache hit is the
+                // first check, above, which streams. This second check only
+                // runs when the URL extension was wrong, so buffering here
+                // does not bring back the large-passthrough case.
+                let (body, len, shared) = cached_hit_parts(cached, flight_leader.is_some()).await?;
+                if let Some(data) = shared {
+                    if let Some(leader) = flight_leader.as_ref() {
+                        leader.publish(Arc::new(crate::inflight::SharedImage {
+                            data,
+                            output_extension: final_output_extension,
+                            original_extension,
+                        }));
+                    }
+                }
+                return image_response_body(
+                    body,
+                    len,
                     final_output_extension,
                     original_extension,
                     quality,
@@ -1386,7 +1497,7 @@ pub async fn resize_handler(
                     error = %e,
                     "Image dimensions check failed"
                 );
-                return Err(e);
+                return Err(fail_inflight(&mut flight_leader, e));
             }
         };
     tracing::debug!(
@@ -1396,8 +1507,9 @@ pub async fn resize_handler(
         orig_width as u64 * orig_height as u64
     );
     if orig_width == 0 || orig_height == 0 {
-        return Err(AppError::DecodeError(
-            "source image has a zero dimension".to_string(),
+        return Err(fail_inflight(
+            &mut flight_leader,
+            AppError::DecodeError("source image has a zero dimension".to_string()),
         ));
     }
     let (width, height) = crate::resize::bound_output_dimensions(
@@ -1416,14 +1528,20 @@ pub async fn resize_handler(
         .clone()
         .acquire_owned()
         .await
-        .map_err(|_| AppError::EncodeError("internal".to_string()))?;
+        .map_err(|_| {
+            fail_inflight(
+                &mut flight_leader,
+                AppError::EncodeError("internal".to_string()),
+            )
+        })?;
     let pixels = image_data;
     let encode_as = final_output_extension.to_string();
     let logged_url = full_url.clone();
     let logged_type = content_type.clone();
     let output_data = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let img = decode_image(&pixels, width, height).map_err(|e| {
+        let _source_permit = source_permit;
+        let (img, extent) = decode_image_exact(&pixels, width, height).map_err(|e| {
             tracing::error!(
                 source_url = %logged_url,
                 content_type = ?logged_type,
@@ -1433,7 +1551,7 @@ pub async fn resize_handler(
             );
             e
         })?;
-        let resized = resize_image(img, width, height, fit)?;
+        let resized = resize_image_exact(img, extent, width, height, fit)?;
         encode_image(resized, &encode_as, quality).map_err(|e| {
             tracing::error!(
                 source_url = %logged_url,
@@ -1449,8 +1567,13 @@ pub async fn resize_handler(
     })
     .await
     {
-        Ok(result) => result?,
-        Err(_) => return Err(AppError::EncodeError("internal".to_string())),
+        Ok(result) => noted(&mut flight_leader, result)?,
+        Err(_) => {
+            return Err(fail_inflight(
+                &mut flight_leader,
+                AppError::EncodeError("internal".to_string()),
+            ));
+        }
     };
 
     let resize_time = resize_start.elapsed();
@@ -1472,14 +1595,25 @@ pub async fn resize_handler(
     let cache_clone = DiskCache::new(resize_cache_path, subdomain_for_cache.as_deref());
     let cache_key_clone = final_cache_key.clone();
     let extension_clone = final_output_extension.to_string();
-    let output_clone = output_data.clone();
+    let shared = Arc::new(crate::inflight::SharedImage {
+        data: output_data.clone(),
+        output_extension: final_output_extension,
+        original_extension,
+    });
+    if let Some(leader) = flight_leader.as_ref() {
+        leader.publish(Arc::clone(&shared));
+    }
+    // The key stays claimed until the result is on disk, so a request that
+    // arrives in between is served from memory instead of resizing again.
+    let leader = flight_leader.take();
     tokio::spawn(async move {
         if let Err(e) = cache_clone
-            .put(&cache_key_clone, &extension_clone, &output_clone)
+            .put(&cache_key_clone, &extension_clone, &shared.data)
             .await
         {
             tracing::error!("Failed to cache image: {}", e);
         }
+        drop(leader);
     });
 
     let total_time = request_start.elapsed();
@@ -1531,6 +1665,16 @@ impl ImageMetrics {
         }
     }
 
+    /// Served from another request that was already in flight.
+    fn coalesced(total: std::time::Duration) -> Self {
+        Self {
+            total_ms: total.as_secs_f64() * 1000.0,
+            fetch_ms: None,
+            resize_ms: None,
+            cache_hit: false,
+        }
+    }
+
     fn processed(
         total: std::time::Duration,
         fetch: std::time::Duration,
@@ -1545,10 +1689,69 @@ impl ImageMetrics {
     }
 }
 
+/// How many cancelled leaders a request will replace before it does the work
+/// without registering. Eight disconnects in a row is already a client problem;
+/// past that, waiting longer would only pile the same work up.
+const INFLIGHT_TAKEOVERS: usize = 8;
+
+fn fail_inflight(leader: &mut Option<crate::inflight::Leader>, err: AppError) -> AppError {
+    if let Some(leader) = leader.take() {
+        leader.fail(Arc::new(err.clone()));
+    }
+    err
+}
+
+fn noted<T>(leader: &mut Option<crate::inflight::Leader>, result: Result<T>) -> Result<T> {
+    result.map_err(|err| fail_inflight(leader, err))
+}
+
+fn coalesced_response(
+    shared: Arc<crate::inflight::SharedImage>,
+    quality: u8,
+    total: std::time::Duration,
+) -> Result<Response> {
+    let mut response = image_response(
+        shared.data.clone(),
+        shared.output_extension,
+        shared.original_extension,
+        quality,
+        ImageMetrics::coalesced(total),
+        false,
+    )?;
+    response.headers_mut().insert(
+        "X-Speedwholes-Coalesced",
+        axum::http::HeaderValue::from_static("1"),
+    );
+    Ok(response)
+}
+
 /// Build an image response with proper headers and timing metrics.
 /// When `nocache` is true, sets no-cache headers and marks cache as "bypass".
 fn image_response(
     data: Vec<u8>,
+    output_extension: &str,
+    original_extension: &str,
+    quality: u8,
+    metrics: ImageMetrics,
+    nocache: bool,
+) -> Result<Response> {
+    let len = data.len() as u64;
+    image_response_body(
+        axum::body::Body::from(data),
+        len,
+        output_extension,
+        original_extension,
+        quality,
+        metrics,
+        nocache,
+    )
+}
+
+/// `image_response` for a body that may be streamed. `len` is its exact length,
+/// so the response keeps a `Content-Length` instead of switching to chunked encoding.
+fn image_response_body(
+    body: axum::body::Body,
+    len: u64,
     output_extension: &str,
     original_extension: &str,
     quality: u8,
@@ -1574,6 +1777,7 @@ fn image_response(
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, len.to_string())
         .header(header::CACHE_CONTROL, cache_control)
         .header("X-Speedwholes-Total-Ms", format!("{:.2}", metrics.total_ms))
         .header("X-Speedwholes-Cache", cache_status)
@@ -1592,7 +1796,7 @@ fn image_response(
     }
 
     response
-        .body(axum::body::Body::from(data))
+        .body(body)
         .map_err(|_| AppError::EncodeError("failed to build image response".to_string()))
 }
 
@@ -1613,10 +1817,85 @@ fn require_image(data: &[u8]) -> Result<&'static str> {
         .ok_or_else(|| AppError::DecodeError("source is not a supported image".to_string()))
 }
 
+/// Sniff and bound-check a cached source without reading it all. The handle
+/// is rewound so the caller can stream it.
+fn inspect_source_file(
+    mut file: std::fs::File,
+    max_pixels: u64,
+) -> Result<(std::fs::File, &'static str)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let read_error = |e: std::io::Error| AppError::CacheError(format!("Failed to read cache: {e}"));
+    let mut head = [0u8; 64];
+    let mut filled = 0;
+    while filled < head.len() {
+        let read = file.read(&mut head[filled..]).map_err(read_error)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    let extension = require_image(&head[..filled])?;
+    file.seek(SeekFrom::Start(0)).map_err(read_error)?;
+    // BufReader is dropped before the seek below, so its buffer cannot leave
+    // the file cursor past the start.
+    let size = imagesize::reader_size(std::io::BufReader::new(&file))
+        .map_err(|e| AppError::DecodeError(format!("Failed to read image dimensions: {e}")))?;
+    if size.width == 0 || size.height == 0 {
+        return Err(AppError::DecodeError(
+            "source image has a zero dimension".to_string(),
+        ));
+    }
+    let pixels = (size.width as u64).saturating_mul(size.height as u64);
+    if pixels > max_pixels {
+        return Err(AppError::ImageDimensionsTooLarge {
+            width: size.width,
+            height: size.height,
+            pixels,
+            max_pixels,
+        });
+    }
+    file.seek(SeekFrom::Start(0)).map_err(read_error)?;
+    Ok((file, extension))
+}
+
+/// Parts of a cache hit. `share` reads a large file into memory so a coalesced
+/// waiter can be handed the bytes. Callers pass `share` only for the rare
+/// extension-mismatch hit; the common hit streams.
+async fn cached_hit_parts(
+    cached: CachedFile,
+    share: bool,
+) -> Result<(axum::body::Body, u64, Option<Vec<u8>>)> {
+    match cached {
+        CachedFile::Small(data) => {
+            let len = data.len() as u64;
+            let shared = share.then(|| data.clone());
+            Ok((axum::body::Body::from(data), len, shared))
+        }
+        CachedFile::Large { mut file, len } => {
+            if !share {
+                return Ok((file_body(file), len, None));
+            }
+            let data = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut data = Vec::new();
+                file.read_to_end(&mut data)
+                    .map_err(|e| AppError::CacheError(format!("Failed to read cache: {e}")))?;
+                Ok(data)
+            })
+            .await
+            .map_err(|_| AppError::CacheError("cache read task failed".to_string()))??;
+            let len = data.len() as u64;
+            let shared = Some(data.clone());
+            Ok((axum::body::Body::from(data), len, shared))
+        }
+    }
+}
+
 /// Build a bypass response - serves source image directly without resize.
 /// Sets appropriate headers indicating bypass mode.
 fn bypass_image_response(
-    data: Vec<u8>,
+    body: axum::body::Body,
+    len: u64,
     extension: &str,
     total_time: std::time::Duration,
     fetch_time: std::time::Duration,
@@ -1638,6 +1917,7 @@ fn bypass_image_response(
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, len.to_string())
         .header(header::CACHE_CONTROL, cache_control)
         .header("X-Speedwholes-Mode", "bypass")
         .header("X-Speedwholes-Total-Ms", format!("{:.2}", total_ms))
@@ -1650,7 +1930,7 @@ fn bypass_image_response(
     }
 
     response
-        .body(axum::body::Body::from(data))
+        .body(body)
         .map_err(|_| AppError::EncodeError("failed to build image response".to_string()))
 }
 

@@ -7,6 +7,47 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+/// Cached files up to this size are read whole. Larger ones are streamed.
+pub const STREAM_THRESHOLD: u64 = 1024 * 1024;
+
+/// Read size for a streamed file. One chunk is in flight per response.
+const STREAM_CHUNK: usize = 256 * 1024;
+
+/// A cache hit: the bytes of a small file, or an open handle for a large one.
+pub enum CachedFile {
+    Small(Vec<u8>),
+    Large { file: std::fs::File, len: u64 },
+}
+
+impl CachedFile {
+    /// Response body and its length. A large file is not buffered.
+    pub fn into_body(self) -> (axum::body::Body, u64) {
+        match self {
+            CachedFile::Small(data) => {
+                let len = data.len() as u64;
+                (axum::body::Body::from(data), len)
+            }
+            CachedFile::Large { file, len } => (file_body(file), len),
+        }
+    }
+}
+
+/// Body that reads an open file one chunk at a time.
+pub fn file_body(file: std::fs::File) -> axum::body::Body {
+    use tokio::io::AsyncReadExt;
+    let file = fs::File::from_std(file);
+    let stream = futures::stream::try_unfold(file, |mut file| async move {
+        let mut chunk = vec![0u8; STREAM_CHUNK];
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        chunk.truncate(read);
+        Ok(Some((axum::body::Bytes::from(chunk), file)))
+    });
+    axum::body::Body::from_stream(stream)
+}
+
 /// Default subdomain name used when no subdomain is specified
 pub const DEFAULT_SUBDOMAIN: &str = "_default";
 
@@ -111,6 +152,30 @@ impl DiskCache {
             }
             Err(e) => Err(AppError::CacheError(format!("Failed to read cache: {}", e))),
         }
+    }
+
+    /// Open a cached file for serving. Small files come back whole, in one
+    /// blocking step. Large files come back as a handle to stream from.
+    pub async fn open(&self, key: &str, extension: &str) -> Result<Option<CachedFile>> {
+        let path = self.cache_path(key, extension);
+        let opened = tokio::task::spawn_blocking(move || -> std::io::Result<Option<CachedFile>> {
+            use std::io::Read;
+            let mut file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let len = file.metadata()?.len();
+            if len > STREAM_THRESHOLD {
+                return Ok(Some(CachedFile::Large { file, len }));
+            }
+            let mut data = Vec::with_capacity(len as usize);
+            file.read_to_end(&mut data)?;
+            Ok(Some(CachedFile::Small(data)))
+        })
+        .await
+        .map_err(|e| AppError::CacheError(format!("Cache read task failed: {e}")))?;
+        opened.map_err(|e| AppError::CacheError(format!("Failed to read cache: {e}")))
     }
 
     /// Store an image in the cache
@@ -358,4 +423,54 @@ fn count_files_sync(path: &std::path::Path) -> u64 {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    async fn round_trip(bytes: &[u8]) -> CachedFile {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::new(dir.path().to_path_buf(), None);
+        cache.init().await.expect("init");
+        cache.put("abcd", "bin", bytes).await.expect("put");
+        let opened = cache
+            .open("abcd", "bin")
+            .await
+            .expect("open")
+            .expect("present");
+        // Unlink the directory while a large file's descriptor is still open.
+        drop(dir);
+        opened
+    }
+
+    #[tokio::test]
+    async fn files_at_the_threshold_are_buffered_and_larger_ones_stream() {
+        let small = vec![9u8; STREAM_THRESHOLD as usize];
+        match round_trip(&small).await {
+            CachedFile::Small(data) => assert_eq!(data, small),
+            CachedFile::Large { .. } => panic!("a file at the threshold was streamed"),
+        }
+
+        let big = vec![4u8; STREAM_THRESHOLD as usize + 1];
+        match round_trip(&big).await {
+            CachedFile::Large { file, len } => {
+                assert_eq!(len, big.len() as u64);
+                let (body, body_len) = CachedFile::Large { file, len }.into_body();
+                assert_eq!(body_len, big.len() as u64);
+                let collected = body.collect().await.expect("stream").to_bytes();
+                assert_eq!(&collected[..], &big[..]);
+            }
+            CachedFile::Small(_) => panic!("a file above the threshold was buffered"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_file_is_a_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = DiskCache::new(dir.path().to_path_buf(), None);
+        cache.init().await.expect("init");
+        assert!(cache.open("abcd", "bin").await.expect("open").is_none());
+    }
 }

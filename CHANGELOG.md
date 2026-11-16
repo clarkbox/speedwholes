@@ -22,6 +22,13 @@
 - Confirm `admin_token` is a secret you generated for that deployment, not a placeholder from an example file.
 - Rollback of the binary is safe with these keys present: the previous binary ignores unknown JSON fields. Keep a copy of the previous binary before you replace it.
 
+### Changed
+
+- Accepted connections set `TCP_NODELAY`, so the last bytes of a large response are not held for a delayed ACK.
+- Cached files larger than 1 MiB are streamed in 256 KiB chunks instead of being read into memory. At most twice `max_concurrent_resizes` source images are held in memory at once. A fetched source is shared with the cache write instead of being copied.
+- Identical uncached requests that overlap share one fetch and resize. A response served from that shared result sends `X-Speedwholes-Coalesced: 1`. `nocache` and bypass do not join. If the leader fails, waiters receive the same error. If the leader's client disconnects, one waiter takes over.
+- Scaled JPEG output is sampled from the exact picture inside the decoded buffer. Output width, height, URLs, formats, and headers are unchanged. Pixels can differ by a fraction of a pixel from earlier builds, which removes a stretch of up to one decoded pixel. Results already in the cache keep the old pixels until they expire.
+
 ### Fixed
 
 - Redirect hops are checked one by one (scheme, allowlist, private addresses), up to five, instead of being followed automatically.

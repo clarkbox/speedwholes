@@ -5,6 +5,7 @@ mod config;
 mod disk_monitor;
 mod error;
 mod handlers;
+mod inflight;
 mod lock;
 mod net;
 mod resize;
@@ -203,7 +204,12 @@ async fn main() {
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
     });
 
-    axum_server::bind_rustls(addr, rustls_config)
+    // TCP_NODELAY is set before the TLS handshake. Without it, the tail of a
+    // large body waits on Nagle's algorithm until the client's delayed ACK.
+    let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+        .acceptor(axum_server::accept::NoDelayAcceptor::new());
+    axum_server::bind(addr)
+        .acceptor(acceptor)
         .handle(handle)
         .serve(app.into_make_service())
         .await
