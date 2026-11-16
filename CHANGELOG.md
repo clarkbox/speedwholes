@@ -33,6 +33,7 @@
 
 - axum 0.8, axum-server 0.9, tower-http 0.6. Route patterns use `{name}` and `{*rest}`. HTTP paths are unchanged.
 - sha2 0.11 and hmac 0.13 together. base64 0.23. imagesize 0.15. nix 0.32.
+- tower-http 0.7, lru 0.19, thiserror 2, parking_lot 0.13, criterion 0.8.
 - `rustls-pemfile` left the graph. AVIF encoding stays disabled so the server does not build the unmaintained `paste` crate; Cargo.lock still records it as an optional image dependency.
 - Admin UI: vue-router 5.
 - `fast_image_resize` 6.1.0.
