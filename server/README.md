@@ -258,6 +258,9 @@ The configuration file is located at `<config-dir>/speedwholes.config.json`:
 | `timeout` | u64 | 30 | Upstream fetch timeout (seconds) |
 | `max_source_pixels` | u64 | 100000000 | Max source image size (100MP) |
 | `max_source_bytes` | u64 | 52428800 | Max upstream body (50 MiB) |
+| `source_proxy_min_side` | u32 | 0 | Off at 0. Minimum long side of a reduced JPEG kept for large JPEG sources. |
+| `source_proxy_quality` | u8 | 90 | JPEG quality of that copy. Clamped to 1–100. |
+| `source_proxy_max_fill_percent` | u8 | 85 | Largest output, as a percent of the copy, made from it. Clamped to 0–100. |
 | `allowed_sources` | array | [] | Allowed source URL patterns |
 | `allow_all_sources` | bool | false | Allow any public host when a tenant has no allowlist. A non-empty tenant `allowed_sources` is always enforced. |
 | `allow_private_networks` | bool | false | Allow loopback and other reserved addresses |

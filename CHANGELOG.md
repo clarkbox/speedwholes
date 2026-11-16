@@ -22,6 +22,10 @@
 - Confirm `admin_token` is a secret you generated for that deployment, not a placeholder from an example file.
 - Rollback of the binary is safe with these keys present: the previous binary ignores unknown JSON fields. Keep a copy of the previous binary before you replace it.
 
+### Added
+
+- `source_proxy_min_side` (default `0`, off), `source_proxy_quality` (default `90`, clamped to 1–100), and `source_proxy_max_fill_percent` (default `85`, clamped to 0–100). When the minimum side is set, a reduced JPEG of a large JPEG source is stored in the source cache and later sizes that fit inside it are resized from that copy. Output width, height, URLs, formats, and headers stay the same. Pixels can differ slightly from the direct path while the feature is on. An output above the fill limit uses the original. Non-JPEG sources are unchanged.
+
 ### Changed
 
 - Accepted connections set `TCP_NODELAY`, so the last bytes of a large response are not held for a delayed ACK.
