@@ -710,6 +710,8 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     pub tls_config: TlsConfig,
     pub resize_permits: Arc<tokio::sync::Semaphore>,
+    /// How many source images may be held in memory at once.
+    pub source_permits: Arc<tokio::sync::Semaphore>,
     /// Identical in-flight resize requests share one result.
     pub inflight: Arc<crate::inflight::Inflight>,
 }
@@ -857,6 +859,10 @@ impl AppState {
             sessions: Arc::new(SessionStore::new()),
             tls_config,
             resize_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            // Two source buffers per resize slot: the one being decoded, and
+            // one fetched ahead of it. saturating_mul so a huge config cannot
+            // overflow the permit count.
+            source_permits: Arc::new(tokio::sync::Semaphore::new(permits.saturating_mul(2))),
             inflight: Arc::new(crate::inflight::Inflight::default()),
         }
     }
@@ -979,5 +985,34 @@ mod tests {
         let good = crate::signing::generate_signature(key, path);
         cache.put("signed", path, &good, true);
         assert_eq!(cache.get("signed", path, &good), Some(true));
+    }
+
+    fn state_with_resize_cap(cap: usize) -> AppState {
+        let cfg = ServerConfig {
+            max_concurrent_resizes: cap,
+            ..ServerConfig::default()
+        };
+        AppState::from_config(
+            cfg,
+            std::path::PathBuf::from("."),
+            TlsConfig {
+                cert_path: std::path::PathBuf::from("cert.pem"),
+                key_path: std::path::PathBuf::from("key.pem"),
+            },
+        )
+    }
+
+    #[test]
+    fn source_permits_are_twice_the_resize_permits() {
+        let state = state_with_resize_cap(3);
+        assert_eq!(state.resize_permits.available_permits(), 3);
+        assert_eq!(state.source_permits.available_permits(), 6);
+    }
+
+    #[test]
+    fn a_zero_resize_cap_still_bounds_sources() {
+        let state = state_with_resize_cap(0);
+        assert_eq!(state.resize_permits.available_permits(), 1);
+        assert_eq!(state.source_permits.available_permits(), 2);
     }
 }
