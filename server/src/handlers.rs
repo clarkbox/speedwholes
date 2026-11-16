@@ -22,6 +22,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Build a JSON error response with the given status code and message.
@@ -1186,6 +1187,43 @@ pub async fn resize_handler(
         }
     }
 
+    // Identical uncached requests share one fetch and resize. Bypass and
+    // nocache do not join: bypass is a different response, and nocache asks
+    // for a fresh one. A failed leader publishes the error so waiters do not
+    // stampede the origin. A dropped leader (the client disconnected) frees
+    // the key and one waiter takes over. Takeovers are bounded.
+    let mut flight_leader = None;
+    if !nocache && !bypass {
+        let flight_key = format!(
+            "{}:{cache_key}",
+            subdomain
+                .as_deref()
+                .unwrap_or(crate::cache::DEFAULT_SUBDOMAIN)
+        );
+        for attempt in 0..INFLIGHT_TAKEOVERS {
+            match state.inflight.join(&flight_key) {
+                crate::inflight::Join::Leader(leader) => {
+                    flight_leader = Some(leader);
+                    break;
+                }
+                crate::inflight::Join::Follower(follower) => match follower.wait().await {
+                    Ok(shared) => {
+                        return coalesced_response(shared, quality, request_start.elapsed());
+                    }
+                    Err(crate::inflight::WaitError::Failed(err)) => return Err((*err).clone()),
+                    Err(crate::inflight::WaitError::Cancelled) => {
+                        if attempt + 1 == INFLIGHT_TAKEOVERS {
+                            tracing::warn!(
+                                flight_key = %flight_key,
+                                "in-flight leaders kept disconnecting; this request will run on its own"
+                            );
+                        }
+                    }
+                },
+            }
+        }
+    }
+
     // Generate source cache key (just URL hash)
     let source_cache_key = DiskCache::generate_source_key(&full_url);
 
@@ -1197,8 +1235,10 @@ pub async fn resize_handler(
             Ok(Some(cached_data)) => {
                 state.stats.record_source_cache_hit();
                 tracing::debug!("Source cache hit: {}", source_cache_key);
-                let content_type =
-                    Some(mime_for_extension(require_image(&cached_data)?).to_string());
+                let content_type = Some(
+                    mime_for_extension(noted(&mut flight_leader, require_image(&cached_data))?)
+                        .to_string(),
+                );
                 (cached_data, content_type, true)
             }
             Ok(None) => {
@@ -1214,8 +1254,10 @@ pub async fn resize_handler(
                 .await
                 {
                     Ok((data, _ct)) => {
-                        let content_type =
-                            Some(mime_for_extension(require_image(&data)?).to_string());
+                        let content_type = Some(
+                            mime_for_extension(noted(&mut flight_leader, require_image(&data))?)
+                                .to_string(),
+                        );
                         // Store in source cache only after the bytes are a supported image.
                         let subdomain_clone = subdomain.clone();
                         let source_cache_clone =
@@ -1241,7 +1283,7 @@ pub async fn resize_handler(
                             error = %e,
                             "Failed to fetch source image"
                         );
-                        return Err(e);
+                        return Err(fail_inflight(&mut flight_leader, e));
                     }
                 }
             }
@@ -1263,8 +1305,10 @@ pub async fn resize_handler(
                 .await
                 {
                     Ok((data, _ct)) => {
-                        let content_type =
-                            Some(mime_for_extension(require_image(&data)?).to_string());
+                        let content_type = Some(
+                            mime_for_extension(noted(&mut flight_leader, require_image(&data))?)
+                                .to_string(),
+                        );
                         (data, content_type, false)
                     }
                     Err(e) => {
@@ -1273,7 +1317,7 @@ pub async fn resize_handler(
                             error = %e,
                             "Failed to fetch source image"
                         );
-                        return Err(e);
+                        return Err(fail_inflight(&mut flight_leader, e));
                     }
                 }
             }
@@ -1291,7 +1335,10 @@ pub async fn resize_handler(
 
     // Bypass mode: return source image directly without resize
     if bypass {
-        crate::resize::check_image_dimensions(&image_data, state.max_source_pixels())?;
+        noted(
+            &mut flight_leader,
+            crate::resize::check_image_dimensions(&image_data, state.max_source_pixels()),
+        )?;
         let total_time = request_start.elapsed();
         let original_extension = extension_from_content_type(content_type.as_deref(), &full_url);
         tracing::info!(
@@ -1345,6 +1392,13 @@ pub async fn resize_handler(
                     final_cache_key,
                     format_duration(total_time)
                 );
+                if let Some(leader) = flight_leader.as_ref() {
+                    leader.publish(Arc::new(crate::inflight::SharedImage {
+                        data: cached_data.clone(),
+                        output_extension: final_output_extension,
+                        original_extension,
+                    }));
+                }
                 return image_response(
                     cached_data,
                     final_output_extension,
@@ -1388,7 +1442,7 @@ pub async fn resize_handler(
                     error = %e,
                     "Image dimensions check failed"
                 );
-                return Err(e);
+                return Err(fail_inflight(&mut flight_leader, e));
             }
         };
     tracing::debug!(
@@ -1398,8 +1452,9 @@ pub async fn resize_handler(
         orig_width as u64 * orig_height as u64
     );
     if orig_width == 0 || orig_height == 0 {
-        return Err(AppError::DecodeError(
-            "source image has a zero dimension".to_string(),
+        return Err(fail_inflight(
+            &mut flight_leader,
+            AppError::DecodeError("source image has a zero dimension".to_string()),
         ));
     }
     let (width, height) = crate::resize::bound_output_dimensions(
@@ -1418,7 +1473,12 @@ pub async fn resize_handler(
         .clone()
         .acquire_owned()
         .await
-        .map_err(|_| AppError::EncodeError("internal".to_string()))?;
+        .map_err(|_| {
+            fail_inflight(
+                &mut flight_leader,
+                AppError::EncodeError("internal".to_string()),
+            )
+        })?;
     let pixels = image_data;
     let encode_as = final_output_extension.to_string();
     let logged_url = full_url.clone();
@@ -1451,8 +1511,13 @@ pub async fn resize_handler(
     })
     .await
     {
-        Ok(result) => result?,
-        Err(_) => return Err(AppError::EncodeError("internal".to_string())),
+        Ok(result) => noted(&mut flight_leader, result)?,
+        Err(_) => {
+            return Err(fail_inflight(
+                &mut flight_leader,
+                AppError::EncodeError("internal".to_string()),
+            ));
+        }
     };
 
     let resize_time = resize_start.elapsed();
@@ -1474,14 +1539,25 @@ pub async fn resize_handler(
     let cache_clone = DiskCache::new(resize_cache_path, subdomain_for_cache.as_deref());
     let cache_key_clone = final_cache_key.clone();
     let extension_clone = final_output_extension.to_string();
-    let output_clone = output_data.clone();
+    let shared = Arc::new(crate::inflight::SharedImage {
+        data: output_data.clone(),
+        output_extension: final_output_extension,
+        original_extension,
+    });
+    if let Some(leader) = flight_leader.as_ref() {
+        leader.publish(Arc::clone(&shared));
+    }
+    // The key stays claimed until the result is on disk, so a request that
+    // arrives in between is served from memory instead of resizing again.
+    let leader = flight_leader.take();
     tokio::spawn(async move {
         if let Err(e) = cache_clone
-            .put(&cache_key_clone, &extension_clone, &output_clone)
+            .put(&cache_key_clone, &extension_clone, &shared.data)
             .await
         {
             tracing::error!("Failed to cache image: {}", e);
         }
+        drop(leader);
     });
 
     let total_time = request_start.elapsed();
@@ -1533,6 +1609,16 @@ impl ImageMetrics {
         }
     }
 
+    /// Served from another request that was already in flight.
+    fn coalesced(total: std::time::Duration) -> Self {
+        Self {
+            total_ms: total.as_secs_f64() * 1000.0,
+            fetch_ms: None,
+            resize_ms: None,
+            cache_hit: false,
+        }
+    }
+
     fn processed(
         total: std::time::Duration,
         fetch: std::time::Duration,
@@ -1545,6 +1631,42 @@ impl ImageMetrics {
             cache_hit: false,
         }
     }
+}
+
+/// How many cancelled leaders a request will replace before it does the work
+/// without registering. Eight disconnects in a row is already a client problem;
+/// past that, waiting longer would only pile the same work up.
+const INFLIGHT_TAKEOVERS: usize = 8;
+
+fn fail_inflight(leader: &mut Option<crate::inflight::Leader>, err: AppError) -> AppError {
+    if let Some(leader) = leader.take() {
+        leader.fail(Arc::new(err.clone()));
+    }
+    err
+}
+
+fn noted<T>(leader: &mut Option<crate::inflight::Leader>, result: Result<T>) -> Result<T> {
+    result.map_err(|err| fail_inflight(leader, err))
+}
+
+fn coalesced_response(
+    shared: Arc<crate::inflight::SharedImage>,
+    quality: u8,
+    total: std::time::Duration,
+) -> Result<Response> {
+    let mut response = image_response(
+        shared.data.clone(),
+        shared.output_extension,
+        shared.original_extension,
+        quality,
+        ImageMetrics::coalesced(total),
+        false,
+    )?;
+    response.headers_mut().insert(
+        "X-Speedwholes-Coalesced",
+        axum::http::HeaderValue::from_static("1"),
+    );
+    Ok(response)
 }
 
 /// Build an image response with proper headers and timing metrics.

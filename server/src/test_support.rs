@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Query, State};
@@ -28,11 +30,12 @@ pub struct HitCounter {
     hits: Mutex<HashMap<String, u64>>,
     bytes_written: Mutex<HashMap<String, u64>>,
     seen_paths: Mutex<Vec<String>>,
+    /// Hold routes (`/hold.jpg`, `/hold-fail.jpg`) block until this is set.
+    released: AtomicBool,
 }
 
 impl HitCounter {
-    /// Request count for `path`. Used by later security tests.
-    #[allow(dead_code)]
+    /// Request count for `path`.
     pub fn hits(&self, path: &str) -> u64 {
         self.hits
             .lock()
@@ -50,6 +53,15 @@ impl HitCounter {
             .get(path)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Let `/hold.jpg` and `/hold-fail.jpg` finish.
+    pub fn release_held(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+
+    fn is_released(&self) -> bool {
+        self.released.load(Ordering::SeqCst)
     }
 
     pub fn seen_paths(&self) -> Vec<String> {
@@ -126,6 +138,8 @@ pub async fn spawn_upstream() -> (SocketAddr, Arc<HitCounter>) {
     let app = Router::new()
         .route("/img.png", route_get(serve_png))
         .route("/img.jpg", route_get(serve_jpg))
+        .route("/hold.jpg", route_get(serve_hold))
+        .route("/hold-fail.jpg", route_get(serve_hold_fail))
         .route("/png.jpg", route_get(serve_png_as_jpg))
         .route("/o/{*rest}", route_get(serve_o))
         .route("/html", route_get(serve_html))
@@ -168,6 +182,22 @@ async fn serve_png(State(state): State<UpstreamState>) -> Response {
 
 async fn serve_jpg(State(state): State<UpstreamState>) -> Response {
     image_response(state.jpeg, "image/jpeg")
+}
+
+async fn wait_for_release(state: &UpstreamState) {
+    while !state.counter.is_released() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn serve_hold(State(state): State<UpstreamState>) -> Response {
+    wait_for_release(&state).await;
+    image_response(state.jpeg, "image/jpeg")
+}
+
+async fn serve_hold_fail(State(state): State<UpstreamState>) -> Response {
+    wait_for_release(&state).await;
+    (StatusCode::INTERNAL_SERVER_ERROR, "upstream failed").into_response()
 }
 
 async fn serve_png_as_jpg(State(state): State<UpstreamState>) -> Response {

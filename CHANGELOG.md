@@ -25,6 +25,7 @@
 ### Changed
 
 - Accepted connections set `TCP_NODELAY`, so the last bytes of a large response are not held for a delayed ACK.
+- Identical uncached requests that overlap share one fetch and resize. A response served from that shared result sends `X-Speedwholes-Coalesced: 1`. `nocache` and bypass do not join. If the leader fails, waiters receive the same error. If the leader's client disconnects, one waiter takes over.
 - Scaled JPEG output is sampled from the exact picture inside the decoded buffer. Output width, height, URLs, formats, and headers are unchanged. Pixels can differ by a fraction of a pixel from earlier builds, which removes a stretch of up to one decoded pixel. Results already in the cache keep the old pixels until they expire.
 
 ### Fixed

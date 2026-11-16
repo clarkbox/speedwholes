@@ -712,3 +712,164 @@ async fn health_ignores_unknown_host() {
         test_support::get(app, "nobody.example.com", "/health", &[]).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
+
+async fn wait_for_hits(counter: &test_support::HitCounter, path: &str, want: u64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while counter.hits(path) < want {
+        if tokio::time::Instant::now() > deadline {
+            panic!("upstream {path} hits stayed at {}", counter.hits(path));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn identical_inflight_requests_share_one_fetch() {
+    let (addr, counter) = test_support::spawn_upstream().await;
+    let (app, _dir) = test_support::test_app(allow_all(), vec![]);
+    let path = format!(
+        "/resize/w/16/h/16/u/http://127.0.0.1:{}/hold.jpg",
+        addr.port()
+    );
+    let app2 = app.clone();
+    let path2 = path.clone();
+    let first =
+        tokio::spawn(async move { test_support::get(app, "example.com", &path, &[]).await });
+    wait_for_hits(&counter, "/hold.jpg", 1).await;
+    let second =
+        tokio::spawn(async move { test_support::get(app2, "example.com", &path2, &[]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(counter.hits("/hold.jpg"), 1, "the waiter must not fetch");
+    counter.release_held();
+
+    let (status1, headers1, body1) = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+        .await
+        .expect("leader timed out")
+        .expect("leader task");
+    let (status2, headers2, body2) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("follower timed out")
+            .expect("follower task");
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body1)
+    );
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body2)
+    );
+    assert_eq!(body1, body2);
+    assert!(headers1.get("x-speedwholes-coalesced").is_none());
+    assert_eq!(
+        headers2
+            .get("x-speedwholes-coalesced")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(counter.hits("/hold.jpg"), 1);
+}
+
+#[tokio::test]
+async fn a_failed_leader_shares_the_error_with_waiters() {
+    let (addr, counter) = test_support::spawn_upstream().await;
+    let (app, _dir) = test_support::test_app(allow_all(), vec![]);
+    let path = format!(
+        "/resize/w/16/h/16/u/http://127.0.0.1:{}/hold-fail.jpg",
+        addr.port()
+    );
+    let app2 = app.clone();
+    let path2 = path.clone();
+    let first =
+        tokio::spawn(async move { test_support::get(app, "example.com", &path, &[]).await });
+    wait_for_hits(&counter, "/hold-fail.jpg", 1).await;
+    let second =
+        tokio::spawn(async move { test_support::get(app2, "example.com", &path2, &[]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(counter.hits("/hold-fail.jpg"), 1);
+    counter.release_held();
+
+    let (status1, _, body1) = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+        .await
+        .expect("leader timed out")
+        .expect("leader task");
+    let (status2, _, body2) = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .expect("follower timed out")
+        .expect("follower task");
+    assert_eq!(status1, StatusCode::BAD_GATEWAY);
+    assert_eq!(status2, StatusCode::BAD_GATEWAY);
+    assert_eq!(body1, body2);
+    assert!(String::from_utf8_lossy(&body1).contains("HTTP 500"));
+    assert_eq!(counter.hits("/hold-fail.jpg"), 1);
+}
+
+#[tokio::test]
+async fn a_disconnected_leader_hands_the_request_to_a_waiter() {
+    let (addr, counter) = test_support::spawn_upstream().await;
+    let (app, _dir) = test_support::test_app(allow_all(), vec![]);
+    let path = format!(
+        "/resize/w/16/h/16/u/http://127.0.0.1:{}/hold.jpg",
+        addr.port()
+    );
+    let app2 = app.clone();
+    let path2 = path.clone();
+    let leader =
+        tokio::spawn(async move { test_support::get(app, "example.com", &path, &[]).await });
+    wait_for_hits(&counter, "/hold.jpg", 1).await;
+    let follower =
+        tokio::spawn(async move { test_support::get(app2, "example.com", &path2, &[]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(counter.hits("/hold.jpg"), 1);
+    leader.abort();
+    wait_for_hits(&counter, "/hold.jpg", 2).await;
+    counter.release_held();
+
+    assert!(leader.await.expect_err("aborted leader").is_cancelled());
+    let (status, headers, body) = tokio::time::timeout(std::time::Duration::from_secs(5), follower)
+        .await
+        .expect("waiter timed out")
+        .expect("waiter task");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(headers.get("x-speedwholes-coalesced").is_none());
+}
+
+#[tokio::test]
+async fn nocache_requests_do_not_coalesce() {
+    let (addr, counter) = test_support::spawn_upstream().await;
+    let (app, _dir) = test_support::test_app(allow_all(), vec![]);
+    let path = format!(
+        "/resize/w/16/h/16/nocache/1/u/http://127.0.0.1:{}/hold.jpg",
+        addr.port()
+    );
+    let app2 = app.clone();
+    let path2 = path.clone();
+    let first =
+        tokio::spawn(async move { test_support::get(app, "example.com", &path, &[]).await });
+    wait_for_hits(&counter, "/hold.jpg", 1).await;
+    let second =
+        tokio::spawn(async move { test_support::get(app2, "example.com", &path2, &[]).await });
+    wait_for_hits(&counter, "/hold.jpg", 2).await;
+    counter.release_held();
+    let (status1, headers1, body1) = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+        .await
+        .expect("first timed out")
+        .expect("first task");
+    let (status2, headers2, _) = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+        .await
+        .expect("second timed out")
+        .expect("second task");
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body1)
+    );
+    assert_eq!(status2, StatusCode::OK);
+    assert!(headers1.get("x-speedwholes-coalesced").is_none());
+    assert!(headers2.get("x-speedwholes-coalesced").is_none());
+}

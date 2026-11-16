@@ -5,6 +5,7 @@ mod config;
 mod disk_monitor;
 mod error;
 mod handlers;
+mod inflight;
 mod lock;
 mod net;
 mod resize;

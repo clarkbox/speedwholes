@@ -710,6 +710,8 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     pub tls_config: TlsConfig,
     pub resize_permits: Arc<tokio::sync::Semaphore>,
+    /// Identical in-flight resize requests share one result.
+    pub inflight: Arc<crate::inflight::Inflight>,
 }
 
 impl AppState {
@@ -855,6 +857,7 @@ impl AppState {
             sessions: Arc::new(SessionStore::new()),
             tls_config,
             resize_permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            inflight: Arc::new(crate::inflight::Inflight::default()),
         }
     }
 
