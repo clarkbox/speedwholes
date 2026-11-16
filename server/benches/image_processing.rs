@@ -7,9 +7,10 @@
 //! - JPG to WebP conversion at various quality levels (60, 80, 100)
 //! - Cache read/write operations
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use image::{DynamicImage, GenericImageView, ImageReader};
 use std::fs;
+use std::hint::black_box;
 use std::io::Cursor;
 use std::path::PathBuf;
 use tempfile::TempDir;
