@@ -5,7 +5,9 @@ use crate::cache::{
 };
 use crate::config::{AppState, ConfigResponse, StatsSnapshot, SubdomainConfig};
 use crate::error::{AppError, Result};
-use crate::resize::{decode_image, encode_image, fetch_image, resize_image, FitMode, OutputFormat};
+use crate::resize::{
+    decode_image_exact, encode_image, fetch_image, resize_image_exact, FitMode, OutputFormat,
+};
 use crate::source_filter;
 use axum::{
     extract::{OriginalUri, State},
@@ -1423,7 +1425,7 @@ pub async fn resize_handler(
     let logged_type = content_type.clone();
     let output_data = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let img = decode_image(&pixels, width, height).map_err(|e| {
+        let (img, extent) = decode_image_exact(&pixels, width, height).map_err(|e| {
             tracing::error!(
                 source_url = %logged_url,
                 content_type = ?logged_type,
@@ -1433,7 +1435,7 @@ pub async fn resize_handler(
             );
             e
         })?;
-        let resized = resize_image(img, width, height, fit)?;
+        let resized = resize_image_exact(img, extent, width, height, fit)?;
         encode_image(resized, &encode_as, quality).map_err(|e| {
             tracing::error!(
                 source_url = %logged_url,
