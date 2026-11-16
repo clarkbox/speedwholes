@@ -22,6 +22,10 @@
 - Confirm `admin_token` is a secret you generated for that deployment, not a placeholder from an example file.
 - Rollback of the binary is safe with these keys present: the previous binary ignores unknown JSON fields. Keep a copy of the previous binary before you replace it.
 
+### Changed
+
+- Accepted connections set `TCP_NODELAY`, so the last bytes of a large response are not held for a delayed ACK.
+
 ### Fixed
 
 - Redirect hops are checked one by one (scheme, allowlist, private addresses), up to five, instead of being followed automatically.
